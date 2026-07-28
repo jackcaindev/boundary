@@ -4,9 +4,9 @@
 
 Boundary is an active reliability-testing and release-gating product for AI agents. It is not a passive tracing product. Its core claim is:
 
-> Given an instrumented AI agent endpoint, Boundary can inject a controlled production failure, capture the resulting execution evidence, identify the first failing system boundary, generate a reproducible regression scenario, and determine whether the agent meets an explicit release policy.
+> Given an instrumented AI agent endpoint, Boundary can inject a controlled production failure, capture the resulting execution evidence, identify the tested agent’s first unsafe divergence, materialize an immutable reproducible regression case from the failed run, and determine whether the agent passes an explicit scenario policy.
 
-The repository README expresses the same claim using “instrumented agent run” and “regression case.” This specification treats “endpoint” and “scenario” as clarifications, not changes to that intent.
+The repository README expresses the same claim using “instrumented agent run” and “regression case.” This specification treats “endpoint” and “scenario” as clarifications, not changes to that intent. When this document uses **first failing boundary**, it means the boundary containing the tested agent’s first unsafe divergence; it never means the deliberately injected fault by default.
 
 This document defines the product outcome Phase 1 must prove. A proposed Phase 1 feature is in scope only if it is necessary to demonstrate or trust that complete outcome.
 
@@ -43,9 +43,19 @@ As a result, teams can ship agents that perform well on happy paths but behave u
 
 ## Product Thesis
 
-If Boundary turns a realistic production failure into a controlled, evidence-backed, reproducible test campaign, an AI engineer can diagnose the first failing boundary and make a repeatable release decision faster and with greater confidence than through manual trace inspection.
+If Boundary turns a realistic production failure into a controlled, evidence-backed, reproducible test campaign, an AI engineer can diagnose the tested agent’s first unsafe divergence and make a repeatable, scenario-scoped release decision faster and with greater confidence than through manual trace inspection.
 
 Phase 1 tests this thesis with one failure mode: a timeout injected into a tool call made by a bundled sample agent.
+
+## Failure-Localization Model
+
+Boundary separates three concepts:
+
+1. **`injection_boundary`:** where Boundary deliberately applies the controlled adverse condition. In Phase 1, this is tool execution.
+2. **`first_unsafe_divergence`:** the earliest system-under-test behavior that violates the scenario’s expected safe recovery behavior. The **first failing boundary** is the boundary containing this divergence.
+3. **`downstream_symptoms`:** later consequences that follow the divergence but are not labeled as the primary diagnosed defect.
+
+For the provisional Phase 1 scenario, Boundary injects a timeout at tool execution. Expected safe behavior is at most one bounded retry followed by an explicit degraded terminal result within the run budget. The vulnerable agent requests more retries than permitted. Its `first_unsafe_divergence` is the retry/control decision that requests the first disallowed retry. Budget exhaustion or an incorrect terminal state is a `downstream_symptom`. The injected timeout is an intended test condition, not the diagnosed system defect.
 
 ## Why Tracing Tools Alone Are Insufficient
 
@@ -67,8 +77,8 @@ Boundary links five capabilities into one auditable loop:
 1. **Controlled fault injection** at a named system boundary.
 2. **Ordered execution evidence** that includes proof of the injected fault.
 3. **Deterministic comparison** against explicit safe-behavior assertions.
-4. **First-failing-boundary localization** based on the earliest observed divergence, with downstream symptoms labeled separately.
-5. **Reproducible regression and release gating** using the same scenario and policy before and after a fix.
+4. **First-unsafe-divergence localization** that distinguishes the tested agent’s first disallowed retry decision from the injection boundary and later symptoms.
+5. **Immutable regression materialization and release gating** that converts the failed run into a stable regression case and uses that artifact to rerun the same inputs, fault, assertions, and policy against the fixed agent version.
 
 The differentiator is the complete loop, not any single trace, diagnosis label, or dashboard.
 
@@ -78,11 +88,12 @@ The differentiator is the complete loop, not any single trace, diagnosis label, 
 2. Boundary invokes the real sample agent and injects a timeout at the intended tool boundary.
 3. Boundary captures ordered execution events, including evidence that the injection occurred.
 4. Boundary compares the observed run with the scenario’s expected safe behavior.
-5. Boundary identifies the earliest observed divergence as the first failing boundary and distinguishes later symptoms.
-6. The run-details view shows the injected fault, event sequence, expected-versus-observed assertions, localization, and failed release result.
-7. The engineer applies the provided narrow fix variant to the sample agent.
-8. The engineer reruns the same saved regression scenario under the same release policy.
-9. Boundary shows changed real execution evidence, satisfied assertions, and a passing release result.
+5. Boundary identifies the first disallowed retry request as the first unsafe divergence at the retry/control boundary and distinguishes later symptoms.
+6. The run-details view shows the injection boundary and proof, event sequence, expected-versus-observed assertions, localization, symptoms, and `FAIL` policy result.
+7. Boundary materializes an immutable regression-case artifact from the failed run and assigns it a stable `regression_case_id`.
+8. The engineer inspects and applies a narrow source change that produces a distinct fixed sample-agent version.
+9. The engineer starts the fixed-agent run from the saved regression case.
+10. Boundary proves that the regression inputs, fault configuration, assertions, and policy are unchanged while only the tested-agent version changes, then reports that the fixed version passes this scenario policy.
 
 ## Phase 1 Vertical Slice
 
@@ -91,20 +102,34 @@ Phase 1 is one production-shaped path:
 ```text
 Create one test campaign
 → run one bundled vulnerable tool-using sample agent
+→ complete one normal control execution
 → inject one controlled tool timeout
 → capture ordered execution evidence
 → compare explicit expected and observed behavior
-→ identify the first failing boundary
-→ show primary failure and downstream symptoms
-→ evaluate one explicit release policy as failed
-→ run the narrowly fixed sample-agent variant
-→ rerun the same regression scenario
-→ evaluate the same release policy as passed
+→ distinguish the injection boundary from the first unsafe divergence
+→ identify the first disallowed retry decision
+→ show downstream symptoms separately
+→ evaluate one explicit scenario policy as FAIL
+→ materialize an immutable regression case with a stable regression_case_id
+→ apply a narrow, inspectable sample-agent source change
+→ start the fixed-agent run from the saved regression case
+→ verify regression inputs, fault, assertions, and policy are unchanged
+→ evaluate the same scenario policy as PASS
 ```
 
 The vertical slice must execute the sample agent both times. Stored or manually constructed “before” and “after” traces do not satisfy the claim.
 
 Phase 1 may expose only the controls and views needed for this path. It does not need a general campaign builder, fault catalog, policy editor, or trace explorer.
+
+## Delivery Gates
+
+### Core mechanism checkpoint
+
+This checkpoint proves the headless vulnerable-to-fixed loop, including immutable regression-case materialization and rerun. It may temporarily use documented ephemeral persistence or direct local process commands. Passing it demonstrates the mechanism only; it is not Phase 1 portfolio completion.
+
+### Phase 1 portfolio complete
+
+Phase 1 is complete only when the mechanism also runs with PostgreSQL as the authoritative run, event, regression-case, analysis, and policy-result store; Docker Compose as the documented clean-start workflow; the minimal inspectable UI; deterministic fake-model automated tests; at least one successful configured real-model manual demonstration; repeated vulnerable `FAIL` and fixed `PASS` verification; and immutable regression-case generation and rerun. Missing the real-model demonstration, PostgreSQL workflow, or Docker Compose workflow leaves Phase 1 incomplete.
 
 ## Phase 1 Acceptance Criteria
 
@@ -113,15 +138,16 @@ Phase 1 is accepted only when all of the following are demonstrated end to end:
 ### Campaign and execution
 
 - An engineer can create and run a campaign against the bundled vulnerable sample agent.
-- The campaign records the exact version of the system-under-test contract, scenario definition, sample-agent variant, and release assertions used for each run.
+- The campaign records the exact version of the system-under-test contract, scenario definition, tested agent, and release assertions used for each run.
 - The vulnerable and fixed runs execute real agent logic; results are not selected fixtures or hand-authored traces.
+- The vulnerable and fixed sample agents have distinct, inspectable version identities, and the rerun proves that only the tested-agent version changed.
 - A completed run is immutable enough to audit: reruns create distinct run records rather than rewriting prior evidence.
 
 ### Controlled fault
 
 - Boundary injects one tool timeout at the declared tool boundary under a deterministic trigger.
 - The evidence identifies the intended injection point and records that the fault was actually applied.
-- A control run or equivalent verification demonstrates that the timeout came from Boundary’s injection mechanism rather than an incidental tool failure.
+- A normal control execution demonstrates that the timeout appears only when Boundary’s injection mechanism is enabled rather than from an incidental tool failure.
 - The injected timeout and relevant timing values are bounded so the demonstration finishes predictably.
 
 ### Evidence
@@ -135,23 +161,34 @@ Phase 1 is accepted only when all of the following are demonstrated end to end:
 
 - Expected safe behavior is represented as explicit, machine-evaluable assertions.
 - Boundary compares expected and observed behavior without requiring an LLM-generated conclusion.
-- The first failing boundary is the boundary associated with the earliest assertion-relevant divergence in the ordered evidence.
-- The report separates that primary divergence from downstream symptoms such as repeated calls, exhausted retries, an incorrect terminal state, or a missed budget.
+- The report identifies tool execution as the injection boundary without labeling the intended timeout as the tested agent’s defect.
+- The first unsafe divergence is the retry/control decision that requests the first retry beyond the permitted single bounded retry.
+- The first failing boundary, if displayed, is the boundary containing that first unsafe divergence.
+- The report separates that divergence from downstream symptoms such as further calls, budget exhaustion, or an incorrect terminal state.
 - The localization result cites the specific evidence and failed assertion that produced it.
 
 ### Regression and release policy
 
-- The initial vulnerable run produces the expected failed assertions and a failed release result.
-- The scenario can be rerun without manually recreating its inputs, injection settings, expected behavior, or release assertions.
-- A narrow, inspectable change in the bundled sample-agent variant addresses the diagnosed behavior.
+- The initial vulnerable run produces the expected failed assertions and a `FAIL` result for this scenario policy.
+- Boundary materializes an immutable regression-case artifact from that failed run and assigns it a stable `regression_case_id`.
+- The artifact contains or immutably references the source run identity, contract version, scenario version, tested input, fault configuration, expected-behavior assertions, policy version, original tested-agent version, and supporting evidence references.
+- The fixed-agent run is started from the saved regression case without manually recreating its inputs, fault configuration, expected behavior, or release assertions.
+- A narrow, inspectable source change with a distinct tested-agent version addresses the diagnosed retry/control behavior; Boundary does not modify the source automatically.
+- Boundary verifies that the contract and scenario versions, tested input, fault configuration, expected-behavior assertions, and policy version remain unchanged while the tested-agent version changes.
 - The fixed run produces materially different execution evidence and satisfies the same release assertions.
-- The same explicit policy produces a passing release result for the fixed run.
+- The same explicit policy produces `PASS` for the fixed version of the agent under this scenario.
 - The release result is a deterministic aggregation of assertion outcomes; it is not a free-form model judgment.
+- Policy results use exactly `PASS`, `FAIL`, `INCOMPLETE`, `INVALID`, or `EXECUTION_ERROR`.
+- Missing required evidence produces `INCOMPLETE`; contradictory, untrusted, or contract-incompatible evidence produces `INVALID`; inability to execute or evaluate the run because of an operational failure produces `EXECUTION_ERROR`. None may silently become `PASS` or `FAIL`.
 
 ### Operability and scope
 
-- A new developer can run the vertical slice locally from documented steps using the chosen local process and container setup.
+- A new developer can start the complete portfolio milestone from documented Docker Compose steps.
+- PostgreSQL is the authoritative store for runs, events, regression cases, analyses, and policy results.
 - Automated tests cover the deterministic injection, ordering, localization, and policy logic at appropriate levels.
+- Boundary’s campaign execution, assertion evaluation, localization, and policy result use plain deterministic service code.
+- The bundled system under test is a minimal tool-using LangGraph agent. Automated tests use a deterministic fake model and explicitly validate contracts and workflow behavior, not model quality.
+- At least one configured manual portfolio demonstration completes successfully using a real model call.
 - The end-to-end demonstration can be repeated reliably in the supported local environment.
 - No Phase 1 non-goal is required to complete the demonstration.
 
@@ -177,7 +214,7 @@ Phase 1 will not include:
 - saved-policy management beyond the one versioned Phase 1 policy;
 - Redis without a measured requirement;
 - multi-agent architecture without independently justified responsibilities;
-- LangGraph unless explicit workflow state provides a concrete advantage for this slice.
+- LangGraph in Boundary’s control plane unless a current control-plane requirement independently justifies it. This does not exclude the bundled LangGraph system under test.
 
 ## Phase 2 Opportunities
 
@@ -214,9 +251,9 @@ This direction is intentionally non-binding. Each capability must own a demonstr
 - **The first-failing-boundary concept may confuse users.** Real systems can have ambiguous causality, concurrent events, or multiple contributing defects.
 - **Evidence may not be trustworthy enough.** A system under test could omit, reorder, duplicate, or fabricate events unless Boundary owns critical evidence and validates the contract.
 - **One bundled demo may feel artificial.** The before-and-after result may prove implementation correctness without proving external product demand.
-- **The fixed variant may overfit the scenario.** A passing policy could demonstrate one narrow response rather than general reliability.
+- **The fixed version may overfit the scenario.** A passing policy could demonstrate one narrow response rather than general reliability.
 - **Determinism may be overstated.** Timing, model behavior, and process scheduling can make timeout scenarios flaky.
-- **Release “pass” may imply too much.** The UI and language must make clear that a pass applies only to the executed scenario and policy version.
+- **`PASS` may imply too much.** The UI and language must say that an agent version passes this scenario policy, not that it is generally production-ready.
 - **Scope may drift toward observability.** A rich trace UI could consume the milestone without proving injection, regression, and gating.
 - **Untrusted content may influence operators or analysis.** Tool and agent output must never be treated as authoritative Boundary control data.
 
@@ -224,8 +261,8 @@ This direction is intentionally non-binding. Each capability must own a demonstr
 
 - What minimum external contract would a real agent team accept to instrument and invoke its endpoint?
 - Is “first failing boundary” the clearest user-facing term, and what evidence makes users trust it?
-- Which expected safe response to a tool timeout is most representative: bounded retry, fallback, explicit failure, or a combination?
-- What should the Phase 1 policy assert so that the vulnerable failure and fixed pass are meaningful rather than contrived?
+- Does the provisional “one bounded retry, then explicit degraded result within budget” behavior represent a meaningful production policy for target users?
+- What exact run-budget and retry-bound values make the Phase 1 policy realistic rather than contrived?
 - How should Boundary communicate the limited scope of a release result?
 - Must the first external integration be endpoint-based, library-based, or sidecar/proxy-based?
 - What evidence must Boundary own independently of the system under test?
@@ -238,10 +275,13 @@ This direction is intentionally non-binding. Each capability must own a demonstr
 
 - The complete vulnerable-to-fixed demonstration succeeds in at least 9 of 10 consecutive clean local executions.
 - The injected fault is evidenced at the intended boundary in every successful demonstration run.
-- The vulnerable variant is localized to the intended first failing boundary and fails the policy in every successful demonstration run.
-- The fixed variant passes the same scenario and policy in every successful demonstration run.
-- A rerun requires no manual reconstruction of scenario inputs, injection configuration, expected behavior, or assertions.
+- The vulnerable version is localized to the first disallowed retry decision—not the injected timeout—and returns `FAIL` for this scenario policy in every successful demonstration run.
+- Every successful vulnerable `FAIL` materializes an immutable regression case with a stable `regression_case_id` and the required provenance and evidence references.
+- The fixed version returns `PASS` for the identical scenario and policy in every successful demonstration run.
+- The fixed run starts from the saved regression case and requires no manual reconstruction of tested input, fault configuration, expected behavior, assertions, or policy.
+- Boundary verifies that those regression properties remain unchanged while only the tested-agent version changes.
 - Every localization and release result links to the exact assertion and recorded evidence used to compute it.
+- Missing, contradictory, untrusted, incompatible, or operationally unavailable evidence is classified as `INCOMPLETE`, `INVALID`, or `EXECUTION_ERROR`, never silently as `PASS` or `FAIL`.
 
 ### Usability and value signals
 
@@ -251,6 +291,18 @@ This direction is intentionally non-binding. Each capability must own a demonstr
 
 These criteria prove the Phase 1 product mechanism and gather an initial demand signal. They do not establish broad production readiness or market fit.
 
+### Workflow-value hypotheses
+
+The following targets are provisional and have no measured baseline. They must be validated with target users and compared with the same users performing manual trace inspection:
+
+- **Time to evidence-backed localization:** a reviewer identifies the injection boundary, first unsafe divergence, and downstream symptoms within five minutes of run completion.
+- **Time to regression:** a reviewer reruns an existing versioned scenario and policy against a new agent version within two minutes, excluding execution time; producing the initial regression from a captured campaign takes less than 15 minutes.
+- **Instrumentation effort:** an engineer familiar with the tested agent can conform a comparable local agent to the minimum Boundary contract in under two hours after dependencies and access are available.
+- **Reviewer comprehension:** at least 80% of target reviewers correctly distinguish injection, divergence, symptoms, and scoped verdict after one walkthrough.
+- **Manual comparison:** target reviewers complete evidence-backed localization and regression rerun faster with Boundary than with manual trace inspection, without a lower correct-localization rate.
+
+These are workflow-value hypotheses, not achieved metrics. Phase 1 should record observed timings, completion rates, correctness, instrumentation effort, and qualitative objections rather than claim improvement without a baseline.
+
 ## Concise Demo Narrative
 
-An engineer runs Boundary’s bundled campaign against a vulnerable sample agent. Boundary deliberately times out the agent’s tool call and records proof of the injection plus the ordered events that follow. The agent handles the timeout unsafely; Boundary points to the earliest divergence from the scenario’s expected safe behavior, labels later retry and terminal-state problems as symptoms, and fails the explicit release policy. The engineer selects the narrowly fixed sample-agent variant and reruns the same saved scenario. A new real execution shows the corrected behavior, the same assertions pass, and Boundary returns a passing release result. The audience can inspect the evidence behind both decisions.
+An engineer runs Boundary’s bundled campaign against a versioned vulnerable LangGraph agent. Boundary deliberately times out tool execution and records Boundary-owned proof of that injection plus the ordered events that follow. One bounded retry is permitted, but the agent requests another: Boundary identifies that retry/control decision as the first unsafe divergence and labels later budget or terminal-state failures as symptoms. The scenario policy returns `FAIL`, and Boundary materializes an immutable regression case with a stable `regression_case_id`, failed-run provenance, unchanged test inputs, and supporting evidence references. The engineer shows a narrow source diff and a distinct fixed agent version, then starts a new run from that saved regression case. Boundary verifies that the tested input, fault configuration, expected-behavior assertions, and policy version remain unchanged while only the tested-agent version changes. The real execution shows the corrected degraded result within budget, and Boundary reports that this version passes this scenario policy with `PASS`.

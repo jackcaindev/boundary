@@ -1,1 +1,1 @@
-Given an instrumented agent run, Boundary can inject a controlled production failure, identify the first failing boundary, generate a reproducible regression case, and determine whether the agent meets a release policy.
+Given an instrumented agent run, Boundary can inject a controlled production failure, capture ordered evidence, identify the tested agent’s first unsafe divergence (the first failing boundary), materialize an immutable reproducible regression case, and determine whether the agent passes an explicit scenario policy.
