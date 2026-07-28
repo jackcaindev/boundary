@@ -1,0 +1,1 @@
+"""Boundary domain models."""

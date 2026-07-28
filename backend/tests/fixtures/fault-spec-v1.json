@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "fault_kind": "tool_timeout",
+  "target_tool": "boundary.phase1.lookup",
+  "trigger_rule": "retry_ordinal_in",
+  "affected_attempts": [0, 1],
+  "tool_client_timeout_ms": 500,
+  "injected_hold_ms": 1000,
+  "maximum_activations": 2,
+  "scenario_id": "phase1.tool-timeout",
+  "scenario_version": 1,
+  "compatible_contract_versions": ["1"]
+}

@@ -1,0 +1,23 @@
+[project]
+name = "boundary"
+version = "0.1.0"
+description = "Boundary's canonical Phase 1 fault-definition kernel"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic==2.13.4",
+    "rfc8785==0.1.4",
+]
+
+[build-system]
+requires = ["uv_build==0.9.30"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+pythonpath = ["src"]
+testpaths = ["tests/unit"]
