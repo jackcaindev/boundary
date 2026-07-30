@@ -1,4 +1,4 @@
-"""SQLAlchemy Core metadata for the four Task 2 tables."""
+"""SQLAlchemy Core metadata through Task 3's fifth physical table."""
 
 from __future__ import annotations
 
@@ -186,6 +186,69 @@ runs = sa.Table(
     sa.CheckConstraint(
         "control_run_id IS NULL OR control_run_id <> run_id",
         name="control_run_not_self",
+    ),
+)
+
+run_capabilities = sa.Table(
+    "run_capabilities",
+    metadata,
+    sa.Column("capability_record_id", sa.Uuid(), primary_key=True),
+    sa.Column(
+        "capability_hash",
+        sa.CHAR(64),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "run_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "runs.run_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column("trace_id", sa.Uuid(), nullable=False),
+    sa.Column("tool_identity", sa.String(128), nullable=False),
+    sa.Column(
+        "no_fault_binding",
+        sa.Boolean(),
+        nullable=False,
+    ),
+    sa.Column("fault_id", sa.Uuid(), nullable=True),
+    sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column(
+        "state",
+        sa.String(16),
+        nullable=False,
+        server_default=sa.text("'active'"),
+    ),
+    sa.Column("retired_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.CheckConstraint(
+        "capability_hash ~ '^[0-9a-f]{64}$'",
+        name="hash_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "tool_identity <> ''",
+        name="tool_identity_not_empty",
+    ),
+    sa.CheckConstraint(
+        "(no_fault_binding AND fault_id IS NULL) OR "
+        "(NOT no_fault_binding AND fault_id IS NOT NULL)",
+        name="fault_binding_consistent",
+    ),
+    sa.CheckConstraint(
+        "(state = 'active' AND retired_at IS NULL) OR "
+        "(state = 'retired' AND retired_at IS NOT NULL)",
+        name="state_retirement_consistent",
     ),
 )
 

@@ -16,6 +16,7 @@ from boundary.persistence.tables import (
     campaigns,
     evidence_records,
     idempotency_records,
+    run_capabilities,
     runs,
 )
 
@@ -27,6 +28,7 @@ APPLICATION_TABLES = {
     "runs",
     "idempotency_records",
     "evidence_records",
+    "run_capabilities",
 }
 
 
@@ -105,6 +107,7 @@ async def database_engine(
 
 async def _clear_application_rows(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
+        await connection.execute(run_capabilities.delete())
         await connection.execute(evidence_records.delete())
         await connection.execute(idempotency_records.delete())
         await connection.execute(runs.delete())

@@ -35,6 +35,26 @@ services:
     networks:
       - data
 
+  sample-agent:
+    build:
+      context: .
+      dockerfile: sample-agent/Dockerfile
+    environment:
+      SAMPLE_AGENT_START_DELAY_MS: "500"
+    healthcheck:
+      test:
+        - CMD
+        - /app/sample-agent/.venv/bin/python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      - app
+
   integration-tests:
     profiles: ["test"]
     build:
@@ -45,15 +65,31 @@ services:
     environment:
       DATABASE_URL: >-
         postgresql+asyncpg://boundary:boundary-local-only@postgres:5432/boundary
+      SUT_BASE_URL: http://sample-agent:8001
     depends_on:
       migrate:
         condition: service_completed_successfully
+      sample-agent:
+        condition: service_healthy
     networks:
       - data
+      - app
+
+  sample-agent-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: sample-agent/Dockerfile
+    command:
+      - /app/sample-agent/.venv/bin/pytest
+    networks:
+      - app
 
 volumes:
   boundary-postgres:
 
 networks:
   data:
+    internal: true
+  app:
     internal: true

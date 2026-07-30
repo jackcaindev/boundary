@@ -10,6 +10,6 @@ RUN uv sync --locked --no-install-project
 
 COPY backend/src ./src
 COPY backend/tests ./tests
+COPY contract-fixtures /app/contract-fixtures
 COPY migrations /app/migrations
 RUN uv sync --locked
-

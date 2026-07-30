@@ -1,16 +1,12 @@
 [project]
-name = "boundary"
+name = "boundary-sample-agent"
 version = "0.1.0"
-description = "Boundary's Phase 1 reliability-testing core"
+description = "Boundary's separate Phase 1 sample system under test"
 requires-python = ">=3.12"
 dependencies = [
-    "alembic==1.18.5",
-    "asyncpg==0.31.0",
     "fastapi==0.120.4",
-    "httpx==0.28.1",
+    "langgraph==1.2.9",
     "pydantic==2.13.4",
-    "rfc8785==0.1.4",
-    "sqlalchemy==2.0.51",
     "uvicorn==0.38.0",
 ]
 
@@ -18,8 +14,12 @@ dependencies = [
 requires = ["uv_build==0.9.30"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-name = "sample_agent"
+
 [dependency-groups]
 dev = [
+    "httpx==0.28.1",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
 ]
@@ -27,10 +27,5 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "strict"
-markers = [
-    "contract: exercises ADR 001 contract behavior",
-    "integration: requires the private Compose PostgreSQL service",
-    "compose: requires separate Compose services",
-]
 pythonpath = ["src"]
 testpaths = ["tests"]

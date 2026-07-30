@@ -10,7 +10,9 @@ From the repository root:
 
 ```console
 cd backend
-uv run --locked pytest tests/unit
+uv run --locked pytest tests/unit tests/contract
+cd ../sample-agent
+uv run --locked pytest
 ```
 
 ### Full PostgreSQL verification
@@ -22,8 +24,16 @@ docker compose --profile test run --build --rm integration-tests
 ```
 
 This starts PostgreSQL, waits for the one-shot migration service to
-complete, and executes the locked test suite inside the private Compose
-data network.
+complete, starts the unexposed sample-agent service, and executes the
+locked Boundary suite across the private Compose application and data
+networks. The critical Task 3 test uses real HTTP between the Boundary
+test container and the separate sample-agent container.
+
+The sample-agent image can be verified independently:
+
+```console
+docker compose --profile test run --build --rm sample-agent-tests
+```
 
 After verification, stop the Compose services without deleting their
 data:
