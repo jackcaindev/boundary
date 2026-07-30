@@ -1,11 +1,14 @@
 [project]
 name = "boundary"
 version = "0.1.0"
-description = "Boundary's canonical Phase 1 fault-definition kernel"
+description = "Boundary's Phase 1 reliability-testing core"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic==1.18.5",
+    "asyncpg==0.31.0",
     "pydantic==2.13.4",
     "rfc8785==0.1.4",
+    "sqlalchemy==2.0.51",
 ]
 
 [build-system]
@@ -15,9 +18,14 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "strict"
+markers = [
+    "integration: requires the private Compose PostgreSQL service",
+]
 pythonpath = ["src"]
-testpaths = ["tests/unit"]
+testpaths = ["tests"]

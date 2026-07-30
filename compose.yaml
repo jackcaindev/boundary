@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: boundary
+      POSTGRES_USER: boundary
+      POSTGRES_PASSWORD: boundary-local-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U boundary -d boundary"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - boundary-postgres:/var/lib/postgresql/data
+    networks:
+      - data
+
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command:
+      - /app/backend/.venv/bin/alembic
+      - -c
+      - /app/migrations/alembic.ini
+      - upgrade
+      - head
+    environment:
+      DATABASE_URL: >-
+        postgresql+asyncpg://boundary:boundary-local-only@postgres:5432/boundary
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - data
+
+  integration-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command:
+      - /app/backend/.venv/bin/pytest
+    environment:
+      DATABASE_URL: >-
+        postgresql+asyncpg://boundary:boundary-local-only@postgres:5432/boundary
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - data
+
+volumes:
+  boundary-postgres:
+
+networks:
+  data:
+    internal: true

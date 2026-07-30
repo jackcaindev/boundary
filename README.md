@@ -1,16 +1,38 @@
 Given an instrumented agent run, Boundary can inject a controlled production failure, capture ordered evidence, identify the tested agent’s first unsafe divergence (the first failing boundary), materialize an immutable reproducible regression case, and determine whether the agent passes an explicit scenario policy.
 
-## Canonical fault-definition kernel
+## Verification
 
 Prerequisites: Python 3.12 or newer and `uv`.
+
+### Unit tests
 
 From the repository root:
 
 ```console
 cd backend
-uv sync --locked
-uv run --locked pytest
+uv run --locked pytest tests/unit
 ```
+
+### Full PostgreSQL verification
+
+From the repository root:
+
+```console
+docker compose --profile test run --build --rm integration-tests
+```
+
+This starts PostgreSQL, waits for the one-shot migration service to
+complete, and executes the locked test suite inside the private Compose
+data network.
+
+After verification, stop the Compose services without deleting their
+data:
+
+```console
+docker compose down
+```
+
+## Canonical fault-definition kernel
 
 The published Phase 1 fixture is
 `backend/tests/fixtures/fault-spec-v1.json`. Its RFC 8785 canonical UTF-8
