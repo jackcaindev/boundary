@@ -1,4 +1,4 @@
-"""SQLAlchemy Core metadata through Task 4's seventh physical table."""
+"""SQLAlchemy Core metadata through Task 5's timeout-proof extension."""
 
 from __future__ import annotations
 
@@ -86,6 +86,8 @@ runs = sa.Table(
         nullable=True,
     ),
     sa.Column("run_role", sa.String(32), nullable=False),
+    sa.Column("fault_spec_id", sa.Uuid(), nullable=True),
+    sa.Column("fault_id", sa.Uuid(), nullable=True, unique=True),
     sa.Column("contract_version", sa.String(32), nullable=False),
     sa.Column("scenario_id", sa.String(128), nullable=False),
     sa.Column("scenario_version", sa.Integer(), nullable=False),
@@ -115,6 +117,13 @@ runs = sa.Table(
     ),
     sa.Column("run_definition_bytes", sa.LargeBinary(), nullable=False),
     sa.Column("run_definition_digest", sa.CHAR(64), nullable=False),
+    sa.Column(
+        "tested_input",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=True,
+    ),
+    sa.Column("tested_input_bytes", sa.LargeBinary(), nullable=True),
+    sa.Column("tested_input_digest", sa.CHAR(64), nullable=True),
     sa.Column(
         "target_producer_cursor",
         sa.BigInteger(),
@@ -196,6 +205,20 @@ runs = sa.Table(
     sa.CheckConstraint(
         "control_run_id IS NULL OR control_run_id <> run_id",
         name="control_run_not_self",
+    ),
+    sa.CheckConstraint(
+        "(run_role = 'control' AND control_run_id IS NULL AND "
+        "fault_spec_id IS NULL AND fault_id IS NULL) OR "
+        "(run_role = 'injected' AND control_run_id IS NOT NULL AND "
+        "fault_spec_id IS NOT NULL AND fault_id IS NOT NULL)",
+        name="role_fault_identity_consistent",
+    ),
+    sa.CheckConstraint(
+        "(tested_input IS NULL AND tested_input_bytes IS NULL AND "
+        "tested_input_digest IS NULL) OR "
+        "(tested_input IS NOT NULL AND tested_input_bytes IS NOT NULL "
+        "AND tested_input_digest ~ '^[0-9a-f]{64}$')",
+        name="tested_input_canonical_consistent",
     ),
 )
 
@@ -514,11 +537,13 @@ tool_calls = sa.Table(
         name="registration_outcome_consistent",
     ),
     sa.CheckConstraint(
-        "(registration_outcome = 'no_fault_configured' AND "
+        "(registration_outcome IN "
+        "('no_fault_configured', 'attempt_not_selected') AND "
         "response_disposition = 'success_response_committed' AND "
         "response_digest ~ '^[0-9a-f]{64}$' AND "
         "response_evidence_id IS NOT NULL) OR "
-        "(registration_outcome <> 'no_fault_configured' AND "
+        "(registration_outcome NOT IN "
+        "('no_fault_configured', 'attempt_not_selected') AND "
         "response_disposition IS NULL AND response_digest IS NULL AND "
         "response_evidence_id IS NULL)",
         name="response_commitment_consistent",
@@ -539,6 +564,52 @@ fault_activations = sa.Table(
         nullable=False,
         server_default=sa.text("'pre_effect_reserved'"),
     ),
+    sa.Column(
+        "activation_evidence_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_records.evidence_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=True,
+        unique=True,
+    ),
+    sa.Column("accepted_request_origin_ns", sa.BigInteger(), nullable=True),
+    sa.Column("activation_started_ns", sa.BigInteger(), nullable=True),
+    sa.Column("client_timeout_boundary_ns", sa.BigInteger(), nullable=True),
+    sa.Column("hold_deadline_ns", sa.BigInteger(), nullable=True),
+    sa.Column(
+        "effect_status",
+        sa.String(32),
+        nullable=False,
+        server_default=sa.text("'not_started'"),
+    ),
+    sa.Column(
+        "effect_proof",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=True,
+    ),
+    sa.Column("effect_proof_bytes", sa.LargeBinary(), nullable=True),
+    sa.Column("effect_proof_digest", sa.CHAR(64), nullable=True),
+    sa.Column(
+        "effect_evidence_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_records.evidence_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=True,
+        unique=True,
+    ),
+    sa.Column("hold_disposition", sa.String(32), nullable=True),
+    sa.Column("runtime_completed_monotonic_ns", sa.BigInteger(), nullable=True),
+    sa.Column("runtime_completed_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column(
         "created_at",
         sa.DateTime(timezone=True),
@@ -572,7 +643,49 @@ fault_activations = sa.Table(
         name="phase1_activation_ordinal",
     ),
     sa.CheckConstraint(
-        "reservation_state = 'pre_effect_reserved'",
-        name="pre_effect_only",
+        "reservation_state IN ('pre_effect_reserved', "
+        "'activation_started', 'effect_realized', 'unproven', "
+        "'runtime_lost')",
+        name="activation_state_valid",
+    ),
+    sa.CheckConstraint(
+        "effect_status IN ('not_started', 'pending', "
+        "'effect_realized', 'unproven', 'runtime_lost')",
+        name="effect_status_valid",
+    ),
+    sa.CheckConstraint(
+        "(reservation_state = 'pre_effect_reserved' AND "
+        "activation_evidence_id IS NULL AND "
+        "accepted_request_origin_ns IS NULL AND activation_started_ns IS NULL "
+        "AND client_timeout_boundary_ns IS NULL AND hold_deadline_ns IS NULL "
+        "AND effect_status = 'not_started') OR "
+        "(reservation_state <> 'pre_effect_reserved' AND "
+        "activation_evidence_id IS NOT NULL AND "
+        "accepted_request_origin_ns IS NOT NULL AND activation_started_ns IS NOT NULL "
+        "AND client_timeout_boundary_ns IS NOT NULL AND hold_deadline_ns IS NOT NULL "
+        "AND activation_started_ns < client_timeout_boundary_ns "
+        "AND client_timeout_boundary_ns < hold_deadline_ns "
+        "AND effect_status <> 'not_started')",
+        name="activation_timing_consistent",
+    ),
+    sa.CheckConstraint(
+        "(effect_status = 'effect_realized' AND effect_proof IS NOT NULL "
+        "AND effect_proof_bytes IS NOT NULL "
+        "AND effect_proof_digest ~ '^[0-9a-f]{64}$' "
+        "AND effect_evidence_id IS NOT NULL) OR "
+        "(effect_status <> 'effect_realized' AND effect_proof IS NULL "
+        "AND effect_proof_bytes IS NULL AND effect_proof_digest IS NULL "
+        "AND effect_evidence_id IS NULL)",
+        name="effect_proof_consistent",
+    ),
+    sa.CheckConstraint(
+        "(hold_disposition IS NULL AND runtime_completed_at IS NULL "
+        "AND runtime_completed_monotonic_ns IS NULL) OR "
+        "(hold_disposition IN ('bounded_hold_complete', 'proof_failed') "
+        "AND runtime_completed_at IS NOT NULL "
+        "AND runtime_completed_monotonic_ns >= hold_deadline_ns) OR "
+        "(hold_disposition = 'runtime_lost' AND runtime_completed_at IS NOT NULL "
+        "AND runtime_completed_monotonic_ns IS NULL)",
+        name="hold_completion_consistent",
     ),
 )

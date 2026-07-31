@@ -23,24 +23,37 @@ from sample_agent.contract_v1 import (
     CancellationRequest,
     CancelledPayload,
     CompletedPayload,
+    DegradedResultPayload,
     EventEnvelope,
     EventPage,
     FailedPayload,
     RunCancelledEvent,
     RunCompletedEvent,
+    DegradedResultEvent,
     RunFailedEvent,
     RunStartedEvent,
+    RetryRequestedEvent,
+    RetryRequestedPayload,
     RunStatus,
     StartedPayload,
     TerminalResult,
     TestRunRequest,
 )
 from sample_agent.graph import ToolLookupPort, build_control_graph
-from sample_agent.tool_client import ToolClientError
+from sample_agent.model import EXPECTED_TOOL
+from sample_agent.tool_client import Phase1ToolClient, ToolClientError
+from sample_agent.versions.fixed import (
+    FIXED_DEGRADED_RESULT_V1,
+    FIXED_VERSION,
+    run_fixed_controller,
+)
+from sample_agent.versions.vulnerable import (
+    VULNERABLE_VERSION,
+    run_vulnerable_controller,
+)
 
 
 AGENT_ID = "boundary.sample-agent"
-VULNERABLE_VERSION = "vulnerable-v1"
 MAX_RETAINED_RUNS = 128
 EVENT_PAGE_SIZE = 64
 
@@ -65,6 +78,10 @@ class PayloadLimitExceeded(Exception):
 
 class InvalidTargetEvent(Exception):
     """A target event violates contiguous or immutable target ordering."""
+
+
+class RunCancelledDuringExecution(Exception):
+    pass
 
 
 @dataclass(slots=True)
@@ -116,6 +133,7 @@ class RunStore:
         self._runs: OrderedDict[UUID, RunRecord] = OrderedDict()
         self._lock = asyncio.Lock()
         self._graph = build_control_graph(tool_client=tool_client)
+        self._tool_client = tool_client or Phase1ToolClient()
 
     async def create(
         self,
@@ -137,7 +155,7 @@ class RunStore:
                 run_id=request.run_id,
                 trace_id=request.trace_id,
                 tested_agent_id=AGENT_ID,
-                tested_agent_version=VULNERABLE_VERSION,
+                tested_agent_version=request.tested_agent_version,
                 query=request.tested_input.query,
                 tool_endpoint=request.tool_endpoint,
                 tool_capability=request.tool_capability,
@@ -147,6 +165,10 @@ class RunStore:
             return self._accepted(record), False
 
     async def execute_control(self, run_id: UUID) -> None:
+        """Backward-compatible name for executing either immutable version."""
+        await self.execute(run_id)
+
+    async def execute(self, run_id: UUID) -> None:
         if self._start_delay_seconds:
             await asyncio.sleep(self._start_delay_seconds)
         async with self._lock:
@@ -168,7 +190,7 @@ class RunStore:
             self._append(record, started)
 
         try:
-            result = await self._graph.ainvoke(
+            selection = await self._graph.ainvoke(
                 {
                     "query": record.query,
                     "run_id": record.run_id,
@@ -178,6 +200,91 @@ class RunStore:
                     "tool_capability": record.tool_capability,
                 }
             )
+            async with self._lock:
+                if self._require(run_id).state != "running":
+                    return
+            if record.fault_id is None and "output" in selection:
+                output = selection["output"]
+                outcome_kind = "success"
+                selected_arguments = None
+            else:
+                selected_arguments = selection.get("selected_arguments")
+            selected_tool = selection.get("selected_tool")
+            if selected_arguments is not None and (
+                selected_tool != EXPECTED_TOOL
+                or not isinstance(selected_arguments, dict)
+            ):
+                raise ValueError("model selection is invalid")
+
+            async def emit_retry(
+                retry_ordinal: int,
+                prior_tool_call_id: UUID,
+                next_tool_call_id: UUID,
+            ) -> None:
+                async with self._lock:
+                    current = self._require(run_id)
+                    if current.state != "running":
+                        raise RunCancelledDuringExecution
+                    event = RetryRequestedEvent(
+                        contract_version=CONTRACT_VERSION,
+                        run_id=current.run_id,
+                        trace_id=current.trace_id,
+                        event_id=uuid4(),
+                        source="sut",
+                        event_type="sut.retry.requested",
+                        boundary="retry_control",
+                        producer_seq=len(current.events) + 1,
+                        tool_call_id=next_tool_call_id,
+                        caused_by_event_id=current.events[-1].event_id,
+                        payload=RetryRequestedPayload(
+                            schema_version=1,
+                            retry_ordinal=retry_ordinal,
+                            prior_tool_call_id=prior_tool_call_id,
+                            next_tool_call_id=next_tool_call_id,
+                        ),
+                    )
+                    self._append(current, event)
+
+            if record.fault_id is None and selected_arguments is not None:
+                response = await self._tool_client.lookup(
+                    endpoint=record.tool_endpoint,
+                    capability=record.tool_capability,
+                    run_id=record.run_id,
+                    trace_id=record.trace_id,
+                    fault_id=None,
+                    arguments=selected_arguments,
+                    tool_call_id=uuid4(),
+                )
+                output = response.result.value
+                outcome_kind = "success"
+            elif record.fault_id is not None and record.tested_agent_version == VULNERABLE_VERSION:
+                output = await run_vulnerable_controller(
+                    self._tool_client,
+                    endpoint=record.tool_endpoint,
+                    capability=record.tool_capability,
+                    run_id=record.run_id,
+                    trace_id=record.trace_id,
+                    fault_id=record.fault_id,
+                    arguments=selected_arguments,
+                    emit_retry=emit_retry,
+                )
+                outcome_kind = "success"
+            elif record.fault_id is not None and record.tested_agent_version == FIXED_VERSION:
+                output = await run_fixed_controller(
+                    self._tool_client,
+                    endpoint=record.tool_endpoint,
+                    capability=record.tool_capability,
+                    run_id=record.run_id,
+                    trace_id=record.trace_id,
+                    fault_id=record.fault_id,
+                    arguments=selected_arguments,
+                    emit_retry=emit_retry,
+                )
+                outcome_kind = "degraded"
+            elif record.fault_id is not None:
+                raise ValueError("tested-agent version is unsupported")
+        except RunCancelledDuringExecution:
+            return
         except (ToolClientError, ValueError):
             async with self._lock:
                 record = self._require(run_id)
@@ -213,6 +320,25 @@ class RunStore:
             record = self._require(run_id)
             if record.state != "running":
                 return
+            if outcome_kind == "degraded":
+                if output != FIXED_DEGRADED_RESULT_V1:
+                    raise InvalidTargetEvent("fixed degraded artifact changed")
+                degraded = DegradedResultEvent(
+                    contract_version=CONTRACT_VERSION,
+                    run_id=record.run_id,
+                    trace_id=record.trace_id,
+                    event_id=uuid4(),
+                    source="sut",
+                    event_type="sut.degraded_result.produced",
+                    boundary="agent",
+                    producer_seq=len(record.events) + 1,
+                    caused_by_event_id=record.events[-1].event_id,
+                    payload=DegradedResultPayload(
+                        schema_version=1,
+                        result=FIXED_DEGRADED_RESULT_V1,
+                    ),
+                )
+                self._append(record, degraded)
             completed = RunCompletedEvent(
                 contract_version=CONTRACT_VERSION,
                 run_id=record.run_id,
@@ -225,7 +351,7 @@ class RunStore:
                 caused_by_event_id=record.events[-1].event_id,
                 payload=CompletedPayload(
                     schema_version=1,
-                    outcome_kind="success",
+                    outcome_kind=outcome_kind,
                 ),
             )
             self._append(record, completed)
@@ -233,8 +359,8 @@ class RunStore:
             self._seal(
                 record,
                 event=completed,
-                outcome_kind="success",
-                output=cast(str, result["output"]),
+                outcome_kind=outcome_kind,
+                output=output,
             )
 
     async def status(self, run_id: UUID) -> RunStatus:

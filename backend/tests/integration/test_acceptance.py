@@ -145,7 +145,7 @@ async def test_clean_migration_reaches_the_single_head(
     assert migration_facts.tables_after_upgrade == APPLICATION_TABLES
     assert (
         migration_facts.database_revision
-        == "0003_tool_calls_activations"
+        == "0004_timeout_proof"
     )
     assert migration_facts.database_revision == migration_facts.head_revision
 

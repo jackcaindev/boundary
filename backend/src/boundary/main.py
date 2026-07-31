@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from uuid import UUID
 
@@ -23,6 +24,10 @@ from boundary.injection.tool_stub import (
     ToolRegistrationError,
     register_tool_call,
 )
+from boundary.injection.timeout import (
+    ActivationRuntime,
+    ActivationRuntimeRegistry,
+)
 from boundary.persistence.database import (
     DatabaseSettings,
     create_database_engine,
@@ -41,6 +46,7 @@ def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await application.state.activation_registry.wait_all()
             if owns_engine:
                 await application.state.database_engine.dispose()
 
@@ -50,6 +56,7 @@ def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     application.state.database_engine = engine
+    application.state.activation_registry = ActivationRuntimeRegistry()
 
     @application.get("/health")
     async def health() -> dict[str, str]:
@@ -110,12 +117,23 @@ def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
                 "TOOL_REGISTRATION_FAILED",
                 "the tool call could not be registered",
             )
+        activation_runtime = (
+            ActivationRuntime.create(
+                run_id=route_run_id,
+                trace_id=parsed.trace_id,
+                fault_id=parsed.fault_id,
+                tool_call_id=parsed.tool_call_id,
+            )
+            if parsed.fault_id is not None
+            else None
+        )
         try:
             registered = await register_tool_call(
                 database_engine,
                 route_run_id=route_run_id,
                 capability_secret=secret,
                 request=parsed,
+                activation_runtime=activation_runtime,
             )
         except ToolRegistrationError as error:
             return _problem(
@@ -130,14 +148,27 @@ def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
                 "DUPLICATE_TOOL_CALL",
                 "the tool-call identity was already registered",
             )
-        if registered.outcome != "no_fault_configured":
+        if registered.activation_evidence_id is not None:
+            assert activation_runtime is not None
+            task = application.state.activation_registry.start(
+                database_engine,
+                activation_runtime,
+            )
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
             return _problem(
-                501,
-                "FAULT_EFFECT_NOT_IMPLEMENTED",
-                "fault effect handling is deferred",
+                504,
+                "INJECTED_TIMEOUT",
+                "the deterministic injected hold completed",
             )
 
         assert registered.response is not None
+        if activation_runtime is not None:
+            activation_runtime.gate.send_success(
+                activation_runtime.clock.monotonic_ns()
+            )
         return JSONResponse(
             content=registered.response.model_dump(mode="json")
         )

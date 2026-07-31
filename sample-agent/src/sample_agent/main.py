@@ -28,6 +28,8 @@ from sample_agent.run_store import (
     RunStore,
     StoreCapacityExceeded,
 )
+from sample_agent.versions.fixed import FIXED_VERSION
+from sample_agent.versions.vulnerable import VULNERABLE_VERSION
 
 
 MAX_REQUEST_BYTES = 128 * 1024
@@ -76,7 +78,7 @@ def create_app(
         return {
             "status": "ok",
             "contract_versions": [CONTRACT_VERSION],
-            "tested_agent_version": "vulnerable-v1",
+            "tested_agent_versions": [VULNERABLE_VERSION, FIXED_VERSION],
             "model_mode": "fake",
         }
 
@@ -107,7 +109,8 @@ def create_app(
             )
         if (
             parsed.tested_agent_id != "boundary.sample-agent"
-            or parsed.tested_agent_version != "vulnerable-v1"
+            or parsed.tested_agent_version
+            not in {VULNERABLE_VERSION, FIXED_VERSION}
         ):
             return _problem(
                 409,
@@ -134,7 +137,7 @@ def create_app(
                 retryable=False,
             )
         if auto_execute:
-            spawn(app.state.run_store.execute_control(parsed.run_id))
+            spawn(app.state.run_store.execute(parsed.run_id))
         return JSONResponse(
             status_code=202,
             content=accepted.model_dump(mode="json"),

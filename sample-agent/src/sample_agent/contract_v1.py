@@ -130,7 +130,7 @@ class DegradedResultPayload(StrictWireModel):
 
 class CompletedPayload(StrictWireModel):
     schema_version: Literal[1]
-    outcome_kind: Literal["success"]
+    outcome_kind: Literal["success", "degraded"]
 
 
 class FailedPayload(StrictWireModel):

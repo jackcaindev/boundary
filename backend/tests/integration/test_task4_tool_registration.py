@@ -22,8 +22,11 @@ from boundary.evidence.canonical import (
 from boundary.injection.capability import (
     CONTROL_TOOL_IDENTITY,
     create_control_capability,
-    create_injected_capability,
     retire_capability,
+)
+from boundary.execution.injected import (
+    bind_control_tested_input,
+    create_injected_sibling,
 )
 from boundary.injection.contract_v1 import (
     LookupArguments,
@@ -103,22 +106,51 @@ async def _control_binding(engine: AsyncEngine):
 
 async def _injected_binding(engine: AsyncEngine):
     accepted = await _accepted_run(engine)
-    fault_id = uuid4()
-    async with engine.begin() as connection:
-        await connection.execute(
-            runs.update()
-            .where(runs.c.run_id == accepted.run_id)
-            .values(run_role="injected")
-        )
-    grant = await create_injected_capability(
+    await bind_control_tested_input(
+        engine,
+        run_id=accepted.run_id,
+        tested_input="phase1 lookup",
+    )
+    control_grant = await create_control_capability(
         engine,
         run_id=accepted.run_id,
         trace_id=accepted.trace_id,
         tool_identity=CONTROL_TOOL_IDENTITY,
-        fault_id=fault_id,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
-    return accepted, grant, fault_id
+    await register_tool_call(
+        engine,
+        route_run_id=accepted.run_id,
+        capability_secret=control_grant.capability_secret,
+        request=_request(
+            run_id=accepted.run_id,
+            trace_id=accepted.trace_id,
+        ),
+    )
+    await retire_capability(engine, control_grant.capability_record_id)
+    async with engine.begin() as connection:
+        await connection.execute(
+            runs.update()
+            .where(runs.c.run_id == accepted.run_id)
+            .values(
+                operational_status="completed",
+                reported_tested_agent_id="boundary.sample-agent",
+                reported_tested_agent_version="vulnerable-v1",
+            )
+        )
+    sibling = await create_injected_sibling(
+        engine,
+        control_run_id=accepted.run_id,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    injected = type(accepted)(
+        campaign_id=sibling.campaign_id,
+        run_id=sibling.run_id,
+        trace_id=sibling.trace_id,
+        evidence_id=sibling.accepted_evidence_id,
+        replayed=False,
+    )
+    return injected, sibling.capability, sibling.fault_id
 
 
 def _request(

@@ -1,4 +1,4 @@
-"""Minimal LangGraph selection followed by the real Boundary tool call."""
+"""Minimal LangGraph initial selection; recovery remains ordinary code."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from uuid import UUID
 from langgraph.graph import END, START, StateGraph
 
 from sample_agent.model import EXPECTED_TOOL, DeterministicFakeModel
-from sample_agent.tool_client import Phase1ToolClient
 from sample_agent.tool_contract_v1 import LookupResponse
 
 
@@ -21,7 +20,6 @@ class ControlState(TypedDict, total=False):
     tool_capability: str
     selected_tool: str
     selected_arguments: dict[str, str]
-    output: str
 
 
 class ToolLookupPort(Protocol):
@@ -42,9 +40,9 @@ def build_control_graph(
     model: DeterministicFakeModel | None = None,
     tool_client: ToolLookupPort | None = None,
 ):
-    """Compile selection plus one real no-fault lookup attempt."""
+    """Compile only the model-controlled initial tool selection."""
     fake_model = model or DeterministicFakeModel()
-    lookup_client = tool_client or Phase1ToolClient()
+    del tool_client
 
     async def select_tool(state: ControlState) -> ControlState:
         selection = await fake_model.select_tool(state["query"])
@@ -53,23 +51,15 @@ def build_control_graph(
             "selected_arguments": selection.arguments,
         }
 
-    async def complete_control(state: ControlState) -> ControlState:
+    async def validate_selection(state: ControlState) -> ControlState:
         if state["selected_tool"] != EXPECTED_TOOL:
             raise ValueError("model selected an unsupported tool")
-        response = await lookup_client.lookup(
-            endpoint=state["tool_endpoint"],
-            capability=state["tool_capability"],
-            run_id=state["run_id"],
-            trace_id=state["trace_id"],
-            fault_id=state["fault_id"],
-            arguments=state["selected_arguments"],
-        )
-        return {"output": response.result.value}
+        return {}
 
     graph = StateGraph(ControlState)
     graph.add_node("select_tool", select_tool)
-    graph.add_node("complete_control", complete_control)
+    graph.add_node("validate_selection", validate_selection)
     graph.add_edge(START, "select_tool")
-    graph.add_edge("select_tool", "complete_control")
-    graph.add_edge("complete_control", END)
+    graph.add_edge("select_tool", "validate_selection")
+    graph.add_edge("validate_selection", END)
     return graph.compile()

@@ -133,6 +133,7 @@ async def create_injected_capability(
                     sa.select(
                         runs.c.trace_id,
                         runs.c.run_role,
+                        runs.c.fault_id,
                         runs.c.operational_status,
                     )
                     .where(runs.c.run_id == run_id)
@@ -147,6 +148,8 @@ async def create_injected_capability(
                 raise CapabilityBindingError(
                     "fault capability requires an injected run"
                 )
+            if run.fault_id != fault_id:
+                raise CapabilityBindingError("fault binding conflicts")
             if run.operational_status not in {"accepted", "running"}:
                 raise CapabilityBindingError("run is not active")
             await connection.execute(

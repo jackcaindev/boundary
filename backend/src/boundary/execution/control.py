@@ -167,6 +167,13 @@ async def execute_control_run(
         raise ValueError("provide either sut_client or http_client")
 
     run = await _load_control_run(engine, run_id)
+    from boundary.execution.injected import bind_control_tested_input
+
+    await bind_control_tested_input(
+        engine,
+        run_id=run_id,
+        tested_input=tested_input,
+    )
     expires_at = datetime.now(timezone.utc) + timedelta(
         milliseconds=execution_budget_ms
     )
@@ -324,6 +331,7 @@ async def _execute_before_deadline(
     http_timeout_seconds: float,
     capability_record_id: UUID,
     state: _CollectionState,
+    expected_outcome_kind: str = "success",
 ) -> ControlExecutionResult:
     accepted = await _deadline_request(
         client.create_run,
@@ -380,6 +388,7 @@ async def _execute_before_deadline(
             run=run,
             capability_record_id=capability_record_id,
             state=state,
+            expected_outcome_kind=expected_outcome_kind,
         )
         if result is not None:
             return result
@@ -654,6 +663,7 @@ async def _complete_normal_terminal(
     run,
     capability_record_id: UUID,
     state: _CollectionState,
+    expected_outcome_kind: str = "success",
 ) -> ControlExecutionResult | None:
     status = state.terminal_status
     if status is None:
@@ -669,10 +679,10 @@ async def _complete_normal_terminal(
     if (
         status.state == "completed"
         and status.terminal_result is not None
-        and status.terminal_result.outcome_kind != "success"
+        and status.terminal_result.outcome_kind != expected_outcome_kind
     ):
         raise EvidenceInvalid(
-            "control completed without a success outcome"
+            "target completed with an unexpected outcome"
         )
     await record_terminal_status(
         engine,

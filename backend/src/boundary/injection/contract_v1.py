@@ -55,6 +55,7 @@ class ToolProblemDetail(StrictToolModel):
         "CAPABILITY_IDENTITY_MISMATCH",
         "DUPLICATE_TOOL_CALL",
         "FAULT_EFFECT_NOT_IMPLEMENTED",
+        "INJECTED_TIMEOUT",
         "TOOL_REGISTRATION_FAILED",
     ]
     message: Annotated[StrictStr, Field(min_length=1, max_length=256)]

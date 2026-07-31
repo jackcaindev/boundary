@@ -22,6 +22,16 @@ from boundary.injection.contract_v1 import (
     LookupResponse,
     LookupResult,
 )
+from boundary.injection.fault_spec import (
+    FAULT_SPEC_V1_ID,
+    FaultDefinitionMismatch,
+    validate_phase1_fault_document,
+)
+from boundary.injection.timeout import (
+    ACTIVATION_EVENT_TYPE,
+    ActivationRuntime,
+    ResponseGateError,
+)
 from boundary.persistence.tables import (
     evidence_records,
     fault_activations,
@@ -43,6 +53,8 @@ RegistrationFailurePoint = Literal[
     "duplicate_counter",
     "tool_call",
     "activation",
+    "gate_closed",
+    "activation_start_evidence",
     "evidence",
     "response_evidence",
     "counters",
@@ -103,6 +115,7 @@ class RegistrationResult:
     response: LookupResponse | None
     outcome: RegistrationOutcome
     pre_effect_reservation_id: UUID | None
+    activation_evidence_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +137,7 @@ async def register_tool_call(
     capability_secret: str,
     request: LookupRequest,
     now: datetime | None = None,
+    activation_runtime: ActivationRuntime | None = None,
     _fail_after: RegistrationFailurePoint | None = None,
 ) -> RegistrationResult | DuplicateRegistration:
     """Register one call under the run lock and allocate all order atomically.
@@ -145,6 +159,8 @@ async def register_tool_call(
     response_digest: str | None = None
     response: LookupResponse | None = None
     reservation_id: UUID | None = None
+    activation_evidence_id: UUID | None = None
+    activation_started_ns: int | None = None
 
     try:
         async with engine.begin() as connection:
@@ -195,6 +211,7 @@ async def register_tool_call(
                 or capability.tool_identity != TOOL_IDENTITY
                 or capability.no_fault_binding != expected_no_fault
                 or request.fault_id != capability.fault_id
+                or (not expected_no_fault and run.fault_id != capability.fault_id)
                 or (
                     capability.no_fault_binding
                     and request.fault_id is not None
@@ -315,6 +332,24 @@ async def register_tool_call(
             elif retry_ordinal not in PHASE1_AFFECTED_ORDINALS:
                 outcome = "attempt_not_selected"
             else:
+                if activation_runtime is not None:
+                    if (
+                        run.fault_spec_id != FAULT_SPEC_V1_ID
+                        or run.fault_id != request.fault_id
+                        or activation_runtime.run_id != route_run_id
+                        or activation_runtime.trace_id != request.trace_id
+                        or activation_runtime.fault_id != request.fault_id
+                        or activation_runtime.tool_call_id != request.tool_call_id
+                    ):
+                        raise CapabilityIdentityMismatch
+                    try:
+                        validate_phase1_fault_document(
+                            run.run_definition,
+                            run.run_definition_bytes,
+                            run.run_definition_digest,
+                        )
+                    except FaultDefinitionMismatch:
+                        raise CapabilityIdentityMismatch from None
                 activation_count = await connection.scalar(
                     sa.select(sa.func.count())
                     .select_from(fault_activations)
@@ -330,9 +365,13 @@ async def register_tool_call(
                 else:
                     outcome = "pre_effect_reserved"
                     activation_ordinal = int(activation_count)
-                    reservation_id = uuid4()
+                    reservation_id = (
+                        activation_runtime.activation_id
+                        if activation_runtime is not None
+                        else uuid4()
+                    )
 
-            if outcome == "no_fault_configured":
+            if outcome in {"no_fault_configured", "attempt_not_selected"}:
                 response = LookupResponse(
                     contract_version=CONTRACT_VERSION,
                     run_id=route_run_id,
@@ -379,6 +418,19 @@ async def register_tool_call(
 
             if reservation_id is not None:
                 assert activation_ordinal is not None
+                reservation_state = "pre_effect_reserved"
+                effect_status = "not_started"
+                if activation_runtime is not None:
+                    try:
+                        activation_started_ns = (
+                            activation_runtime.close_success_gate()
+                        )
+                    except ResponseGateError:
+                        raise ToolRegistrationPersistenceError from None
+                    _raise_for_test_failure(_fail_after, "gate_closed")
+                    activation_evidence_id = uuid4()
+                    reservation_state = "activation_started"
+                    effect_status = "pending"
                 await connection.execute(
                     fault_activations.insert().values(
                         activation_id=reservation_id,
@@ -386,7 +438,25 @@ async def register_tool_call(
                         tool_call_id=request.tool_call_id,
                         fault_id=capability.fault_id,
                         activation_ordinal=activation_ordinal,
-                        reservation_state="pre_effect_reserved",
+                        reservation_state=reservation_state,
+                        activation_evidence_id=activation_evidence_id,
+                        accepted_request_origin_ns=(
+                            activation_runtime.accepted_request_origin_ns
+                            if activation_runtime is not None
+                            else None
+                        ),
+                        activation_started_ns=activation_started_ns,
+                        client_timeout_boundary_ns=(
+                            activation_runtime.client_timeout_boundary_ns
+                            if activation_runtime is not None
+                            else None
+                        ),
+                        hold_deadline_ns=(
+                            activation_runtime.hold_deadline_ns
+                            if activation_runtime is not None
+                            else None
+                        ),
+                        effect_status=effect_status,
                     )
                 )
             _raise_for_test_failure(_fail_after, "activation")
@@ -459,6 +529,50 @@ async def register_tool_call(
             _raise_for_test_failure(_fail_after, "evidence")
 
             accepted_evidence_count = 2
+            if activation_evidence_id is not None:
+                assert activation_runtime is not None
+                assert activation_started_ns is not None
+                activation_payload = {
+                    "accepted_request_origin_ns": (
+                        activation_runtime.accepted_request_origin_ns
+                    ),
+                    "activation_id": str(reservation_id),
+                    "activation_started_ns": activation_started_ns,
+                    "client_timeout_boundary_ns": (
+                        activation_runtime.client_timeout_boundary_ns
+                    ),
+                    "fault_id": str(capability.fault_id),
+                    "fault_spec_id": str(FAULT_SPEC_V1_ID),
+                    "hold_deadline_ns": activation_runtime.hold_deadline_ns,
+                    "response_gate_closed": True,
+                    "retry_ordinal": retry_ordinal,
+                    "schema_version": 1,
+                    "tool_call_id": str(request.tool_call_id),
+                }
+                activation_bytes = rfc8785.dumps(activation_payload)
+                await connection.execute(
+                    evidence_records.insert().values(
+                        evidence_id=activation_evidence_id,
+                        run_id=route_run_id,
+                        source="boundary",
+                        event_type=ACTIVATION_EVENT_TYPE,
+                        boundary="tool_execution",
+                        source_event_id=activation_evidence_id,
+                        producer_seq=None,
+                        receipt_seq=run.next_receipt_seq + 2,
+                        caused_by_event_id=ordinal_evidence_id,
+                        payload_schema_version=1,
+                        payload=json.loads(activation_bytes),
+                        payload_canonical_bytes=activation_bytes,
+                        payload_digest=sha256(activation_bytes).hexdigest(),
+                        disposition="accepted",
+                    )
+                )
+                accepted_evidence_count = 3
+                _raise_for_test_failure(
+                    _fail_after,
+                    "activation_start_evidence",
+                )
             if response_evidence_id is not None:
                 assert response_digest is not None
                 response_payload = {
@@ -531,6 +645,7 @@ async def register_tool_call(
         response=response,
         outcome=outcome,
         pre_effect_reservation_id=reservation_id,
+        activation_evidence_id=activation_evidence_id,
     )
 
 
