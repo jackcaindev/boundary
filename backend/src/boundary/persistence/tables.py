@@ -1,4 +1,4 @@
-"""SQLAlchemy Core metadata through Task 3's fifth physical table."""
+"""SQLAlchemy Core metadata through Task 4's seventh physical table."""
 
 from __future__ import annotations
 
@@ -129,6 +129,12 @@ runs = sa.Table(
         server_default=sa.text("1"),
     ),
     sa.Column(
+        "next_audit_seq",
+        sa.BigInteger(),
+        nullable=False,
+        server_default=sa.text("1"),
+    ),
+    sa.Column(
         "next_tool_ordinal",
         sa.Integer(),
         nullable=False,
@@ -178,6 +184,10 @@ runs = sa.Table(
     sa.CheckConstraint(
         "next_receipt_seq > 0",
         name="next_receipt_seq_positive",
+    ),
+    sa.CheckConstraint(
+        "next_audit_seq > 0",
+        name="next_audit_seq_positive",
     ),
     sa.CheckConstraint(
         "next_tool_ordinal >= 0",
@@ -323,7 +333,8 @@ evidence_records = sa.Table(
     sa.Column("boundary", sa.String(64), nullable=False),
     sa.Column("source_event_id", sa.Uuid(), nullable=False),
     sa.Column("producer_seq", sa.BigInteger(), nullable=True),
-    sa.Column("receipt_seq", sa.BigInteger(), nullable=False),
+    sa.Column("receipt_seq", sa.BigInteger(), nullable=True),
+    sa.Column("audit_seq", sa.BigInteger(), nullable=True),
     sa.Column("caused_by_event_id", sa.Uuid(), nullable=True),
     sa.Column("payload_schema_version", sa.Integer(), nullable=False),
     sa.Column(
@@ -347,6 +358,11 @@ evidence_records = sa.Table(
     ),
     sa.UniqueConstraint(
         "run_id",
+        "audit_seq",
+        name="uq_evidence_records_run_audit_seq",
+    ),
+    sa.UniqueConstraint(
+        "run_id",
         "source",
         "source_event_id",
         name="uq_evidence_records_run_source_event",
@@ -366,8 +382,11 @@ evidence_records = sa.Table(
         name="producer_seq_by_source",
     ),
     sa.CheckConstraint(
-        "receipt_seq > 0",
-        name="receipt_seq_positive",
+        "(disposition = 'accepted' AND receipt_seq > 0 "
+        "AND audit_seq IS NULL) OR "
+        "(disposition IN ('rejected', 'late') "
+        "AND receipt_seq IS NULL AND audit_seq > 0)",
+        name="ordering_by_disposition",
     ),
     sa.CheckConstraint(
         "payload_schema_version > 0",
@@ -380,5 +399,180 @@ evidence_records = sa.Table(
     sa.CheckConstraint(
         "disposition IN ('accepted', 'rejected', 'late')",
         name="disposition_valid",
+    ),
+)
+
+tool_calls = sa.Table(
+    "tool_calls",
+    metadata,
+    sa.Column("run_id", sa.Uuid(), nullable=False),
+    sa.Column("tool_call_id", sa.Uuid(), nullable=False),
+    sa.Column(
+        "capability_record_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "run_capabilities.capability_record_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column("trace_id", sa.Uuid(), nullable=False),
+    sa.Column("tool_identity", sa.String(128), nullable=False),
+    sa.Column("fault_id", sa.Uuid(), nullable=True),
+    sa.Column("retry_ordinal", sa.Integer(), nullable=False),
+    sa.Column("request_digest", sa.CHAR(64), nullable=False),
+    sa.Column(
+        "arrival_evidence_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_records.evidence_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "ordinal_evidence_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_records.evidence_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column("registration_outcome", sa.String(32), nullable=False),
+    sa.Column("response_disposition", sa.String(32), nullable=True),
+    sa.Column("response_digest", sa.CHAR(64), nullable=True),
+    sa.Column(
+        "response_evidence_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_records.evidence_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=True,
+        unique=True,
+    ),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.PrimaryKeyConstraint(
+        "run_id",
+        "tool_call_id",
+        name="pk_tool_calls",
+    ),
+    sa.ForeignKeyConstraint(
+        ["run_id"],
+        ["runs.run_id"],
+        name="fk_tool_calls_run_id_runs",
+        ondelete="RESTRICT",
+        onupdate="RESTRICT",
+    ),
+    sa.UniqueConstraint(
+        "run_id",
+        "retry_ordinal",
+        name="uq_tool_calls_run_retry_ordinal",
+    ),
+    sa.UniqueConstraint(
+        "run_id",
+        "tool_call_id",
+        "fault_id",
+        name="uq_tool_calls_run_call_fault",
+    ),
+    sa.CheckConstraint(
+        "tool_identity <> ''",
+        name="tool_identity_not_empty",
+    ),
+    sa.CheckConstraint(
+        "retry_ordinal >= 0",
+        name="retry_ordinal_nonnegative",
+    ),
+    sa.CheckConstraint(
+        "request_digest ~ '^[0-9a-f]{64}$'",
+        name="request_digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "(fault_id IS NULL AND "
+        "registration_outcome = 'no_fault_configured') OR "
+        "(fault_id IS NOT NULL AND registration_outcome IN "
+        "('pre_effect_reserved', 'attempt_not_selected', "
+        "'maximum_activations_reached'))",
+        name="registration_outcome_consistent",
+    ),
+    sa.CheckConstraint(
+        "(registration_outcome = 'no_fault_configured' AND "
+        "response_disposition = 'success_response_committed' AND "
+        "response_digest ~ '^[0-9a-f]{64}$' AND "
+        "response_evidence_id IS NOT NULL) OR "
+        "(registration_outcome <> 'no_fault_configured' AND "
+        "response_disposition IS NULL AND response_digest IS NULL AND "
+        "response_evidence_id IS NULL)",
+        name="response_commitment_consistent",
+    ),
+)
+
+fault_activations = sa.Table(
+    "fault_activations",
+    metadata,
+    sa.Column("activation_id", sa.Uuid(), primary_key=True),
+    sa.Column("run_id", sa.Uuid(), nullable=False),
+    sa.Column("tool_call_id", sa.Uuid(), nullable=False),
+    sa.Column("fault_id", sa.Uuid(), nullable=False),
+    sa.Column("activation_ordinal", sa.SmallInteger(), nullable=False),
+    sa.Column(
+        "reservation_state",
+        sa.String(32),
+        nullable=False,
+        server_default=sa.text("'pre_effect_reserved'"),
+    ),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.ForeignKeyConstraint(
+        ["run_id", "tool_call_id", "fault_id"],
+        [
+            "tool_calls.run_id",
+            "tool_calls.tool_call_id",
+            "tool_calls.fault_id",
+        ],
+        name="fk_fault_activations_registered_tool_call",
+        ondelete="RESTRICT",
+        onupdate="RESTRICT",
+    ),
+    sa.UniqueConstraint(
+        "run_id",
+        "tool_call_id",
+        name="uq_fault_activations_run_tool_call",
+    ),
+    sa.UniqueConstraint(
+        "run_id",
+        "fault_id",
+        "activation_ordinal",
+        name="uq_fault_activations_run_fault_ordinal",
+    ),
+    sa.CheckConstraint(
+        "activation_ordinal >= 0 AND activation_ordinal < 2",
+        name="phase1_activation_ordinal",
+    ),
+    sa.CheckConstraint(
+        "reservation_state = 'pre_effect_reserved'",
+        name="pre_effect_only",
     ),
 )

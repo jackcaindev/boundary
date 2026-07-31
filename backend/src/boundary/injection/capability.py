@@ -109,6 +109,74 @@ async def create_control_capability(
     )
 
 
+async def create_injected_capability(
+    engine: AsyncEngine,
+    *,
+    run_id: UUID,
+    trace_id: UUID,
+    tool_identity: str,
+    fault_id: UUID,
+    expires_at: datetime,
+) -> CapabilityGrant:
+    """Create one fresh fault-bound capability for an injected run."""
+    if not tool_identity or len(tool_identity) > 128:
+        raise CapabilityBindingError("tool identity is invalid")
+    if expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
+        raise CapabilityBindingError("capability expiry must be in the future")
+    secret = secrets.token_urlsafe(CAPABILITY_BYTES)
+    secret_hash = sha256(secret.encode("ascii")).hexdigest()
+    record_id = uuid4()
+    try:
+        async with engine.begin() as connection:
+            run = (
+                await connection.execute(
+                    sa.select(
+                        runs.c.trace_id,
+                        runs.c.run_role,
+                        runs.c.operational_status,
+                    )
+                    .where(runs.c.run_id == run_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if run is None:
+                raise CapabilityBindingError("run does not exist")
+            if run.trace_id != trace_id:
+                raise CapabilityBindingError("trace binding conflicts")
+            if run.run_role != "injected":
+                raise CapabilityBindingError(
+                    "fault capability requires an injected run"
+                )
+            if run.operational_status not in {"accepted", "running"}:
+                raise CapabilityBindingError("run is not active")
+            await connection.execute(
+                run_capabilities.insert().values(
+                    capability_record_id=record_id,
+                    capability_hash=secret_hash,
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    tool_identity=tool_identity,
+                    no_fault_binding=False,
+                    fault_id=fault_id,
+                    expires_at=expires_at,
+                    state="active",
+                    retired_at=None,
+                )
+            )
+    except CapabilityBindingError:
+        raise
+    except IntegrityError:
+        raise CapabilityBindingError(
+            "run already has a capability binding"
+        ) from None
+    except SQLAlchemyError:
+        raise CapabilityError("capability persistence failed") from None
+    return CapabilityGrant(
+        capability_record_id=record_id,
+        capability_secret=secret,
+    )
+
+
 async def retire_capability(
     engine: AsyncEngine,
     capability_record_id: UUID,

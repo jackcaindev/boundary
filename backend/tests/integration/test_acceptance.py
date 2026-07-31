@@ -143,7 +143,10 @@ async def test_clean_migration_reaches_the_single_head(
 ) -> None:
     assert migration_facts.tables_before_upgrade == frozenset()
     assert migration_facts.tables_after_upgrade == APPLICATION_TABLES
-    assert migration_facts.database_revision == "0002_run_capabilities"
+    assert (
+        migration_facts.database_revision
+        == "0003_tool_calls_activations"
+    )
     assert migration_facts.database_revision == migration_facts.head_revision
 
 

@@ -648,7 +648,8 @@ async def record_safe_rejection(
                 boundary="run",
                 source_event_id=evidence_id,
                 producer_seq=None,
-                receipt_seq=run.next_receipt_seq,
+                receipt_seq=None,
+                audit_seq=run.next_audit_seq,
                 caused_by_event_id=None,
                 payload_schema_version=1,
                 payload=payload,
@@ -660,7 +661,7 @@ async def record_safe_rejection(
         await connection.execute(
             runs.update()
             .where(runs.c.run_id == run_id)
-            .values(next_receipt_seq=run.next_receipt_seq + 1)
+            .values(next_audit_seq=run.next_audit_seq + 1)
         )
 
 

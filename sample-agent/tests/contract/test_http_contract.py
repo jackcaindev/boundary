@@ -7,7 +7,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from conftest import RUN_ID, TRACE_ID, control_request
+from conftest import RUN_ID, TRACE_ID, control_request, control_store
 from sample_agent.contract_v1 import (
     CONTRACT_VERSION_HEADER,
     CONTRACT_VERSIONS_HEADER,
@@ -17,12 +17,11 @@ from sample_agent.contract_v1 import (
     RunStatus,
 )
 from sample_agent.main import create_app
-from sample_agent.run_store import RunStore
 
 
 @pytest_asyncio.fixture
 async def manual_client():
-    app = create_app(store=RunStore(), auto_execute=False)
+    app = create_app(store=control_store(), auto_execute=False)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://sample-agent",

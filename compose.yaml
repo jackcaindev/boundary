@@ -35,6 +35,38 @@ services:
     networks:
       - data
 
+  boundary:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command:
+      - /app/backend/.venv/bin/uvicorn
+      - boundary.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      DATABASE_URL: >-
+        postgresql+asyncpg://boundary:boundary-local-only@postgres:5432/boundary
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - /app/backend/.venv/bin/python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      - data
+      - app
+
   sample-agent:
     build:
       context: .
@@ -52,6 +84,9 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+    depends_on:
+      boundary:
+        condition: service_healthy
     networks:
       - app
 
@@ -66,10 +101,13 @@ services:
       DATABASE_URL: >-
         postgresql+asyncpg://boundary:boundary-local-only@postgres:5432/boundary
       SUT_BASE_URL: http://sample-agent:8001
+      BOUNDARY_INTERNAL_BASE_URL: http://boundary:8000
     depends_on:
       migrate:
         condition: service_completed_successfully
       sample-agent:
+        condition: service_healthy
+      boundary:
         condition: service_healthy
     networks:
       - data

@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from conftest import RUN_ID, control_request
+from conftest import RUN_ID, control_request, control_store
 from sample_agent.contract_v1 import (
     DegradedResultEvent,
     DegradedResultPayload,
@@ -15,7 +15,6 @@ from sample_agent.run_store import (
     MAX_RETAINED_RUNS,
     InvalidTargetEvent,
     PayloadLimitExceeded,
-    RunStore,
     StoreCapacityExceeded,
 )
 
@@ -37,7 +36,7 @@ def _started(sequence: int) -> RunStartedEvent:
 
 @pytest.mark.asyncio
 async def test_contiguous_sequences_start_at_one_and_seal() -> None:
-    store = RunStore()
+    store = control_store()
     await store.create(control_request())
     await store.execute_control(RUN_ID)
 
@@ -51,7 +50,7 @@ async def test_contiguous_sequences_start_at_one_and_seal() -> None:
 
 @pytest.mark.asyncio
 async def test_per_event_limit_is_enforced() -> None:
-    store = RunStore()
+    store = control_store()
     request = control_request()
     await store.create(request)
     event = DegradedResultEvent(
@@ -74,7 +73,7 @@ async def test_per_event_limit_is_enforced() -> None:
 
 @pytest.mark.asyncio
 async def test_event_count_limit_is_enforced() -> None:
-    store = RunStore()
+    store = control_store()
     await store.create(control_request())
     for sequence in range(1, 257):
         await store.append_event(RUN_ID, _started(sequence))
@@ -84,7 +83,7 @@ async def test_event_count_limit_is_enforced() -> None:
 
 @pytest.mark.asyncio
 async def test_total_event_bytes_limit_is_enforced() -> None:
-    store = RunStore()
+    store = control_store()
     request = control_request()
     await store.create(request)
     rejected = False
@@ -113,7 +112,7 @@ async def test_total_event_bytes_limit_is_enforced() -> None:
 
 @pytest.mark.asyncio
 async def test_terminal_output_limit_is_enforced() -> None:
-    store = RunStore()
+    store = control_store()
     await store.create(control_request())
 
     class OversizedGraph:
@@ -128,7 +127,7 @@ async def test_terminal_output_limit_is_enforced() -> None:
 
 @pytest.mark.asyncio
 async def test_process_local_run_retention_is_bounded() -> None:
-    store = RunStore(max_runs=1)
+    store = control_store(max_runs=1)
     await store.create(control_request())
     with pytest.raises(StoreCapacityExceeded):
         await store.create(

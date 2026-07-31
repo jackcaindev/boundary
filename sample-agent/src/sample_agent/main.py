@@ -1,4 +1,4 @@
-"""FastAPI assembly for the separate Task 3 sample-agent service."""
+"""FastAPI assembly for the separate sample agent and real tool client."""
 
 from __future__ import annotations
 

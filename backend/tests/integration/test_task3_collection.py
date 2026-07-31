@@ -814,9 +814,18 @@ async def test_rejected_content_persists_only_safe_metadata(
                 )
             )
         ).one()
+        run = (
+            await connection.execute(
+                sa.select(runs).where(runs.c.run_id == accepted.run_id)
+            )
+        ).one()
     assert rejected not in row.payload_canonical_bytes
     assert row.payload["byte_count"] == len(rejected)
     assert row.payload["content_sha256"] == sha256(rejected).hexdigest()
+    assert row.receipt_seq is None
+    assert row.audit_seq == 1
+    assert run.next_receipt_seq == 2
+    assert run.next_audit_seq == 2
 
 
 async def test_cancellation_request_evidence_is_safe_and_idempotent(

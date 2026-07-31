@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+import rfc8785
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -17,10 +19,13 @@ from boundary.evidence.canonical import (
     fault_definition_digest,
 )
 from boundary.execution.control import execute_control_run
+from boundary.injection.contract_v1 import LookupResponse, LookupResult
 from boundary.persistence.tables import (
     evidence_records,
+    fault_activations,
     run_capabilities,
     runs,
+    tool_calls,
 )
 from boundary.persistence.transactions import (
     AcceptanceCommand,
@@ -92,13 +97,20 @@ async def test_real_http_control_reaches_complete_ordered_terminal_state(
         run_id=accepted.run_id,
         sut_base_url=base_url,
         tool_endpoint=(
-            f"http://boundary:8000/internal/tools/{accepted.run_id}"
+            "http://boundary:8000/internal/v1/runs/"
+            f"{accepted.run_id}/tools/phase1-lookup"
         ),
         tested_input="complete the normal control",
         execution_budget_ms=5_000,
         poll_interval_ms=20,
         http_timeout_seconds=2,
     )
+    async with httpx.AsyncClient(base_url=base_url, timeout=2) as client:
+        target_status = RunStatus.model_validate_json(
+            (
+                await client.get(f"/test-runs/{accepted.run_id}")
+            ).content
+        )
 
     async with database_engine.connect() as connection:
         run = (
@@ -120,9 +132,32 @@ async def test_real_http_control_reaches_complete_ordered_terminal_state(
                 )
             )
         ).one()
+        registered_calls = (
+            await connection.execute(
+                sa.select(tool_calls).where(
+                    tool_calls.c.run_id == accepted.run_id
+                )
+            )
+        ).all()
+        response_evidence = (
+            await connection.execute(
+                sa.select(evidence_records).where(
+                    evidence_records.c.evidence_id
+                    == registered_calls[0].response_evidence_id
+                )
+            )
+        ).one()
+        activation_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(fault_activations)
+            .where(fault_activations.c.run_id == accepted.run_id)
+        )
 
     assert result.operational_status == "completed"
     assert result.final_producer_seq == 2
+    assert target_status.state == "completed"
+    assert target_status.terminal_result is not None
+    assert target_status.terminal_result.output == "control-ok"
     assert run.operational_status == "completed"
     assert run.reported_tested_agent_id == "boundary.sample-agent"
     assert run.reported_tested_agent_version == "vulnerable-v1"
@@ -131,6 +166,50 @@ async def test_real_http_control_reaches_complete_ordered_terminal_state(
     assert [row.receipt_seq for row in evidence] == list(
         range(1, len(evidence) + 1)
     )
+    assert len(registered_calls) == 1
+    assert registered_calls[0].retry_ordinal == 0
+    assert (
+        registered_calls[0].registration_outcome
+        == "no_fault_configured"
+    )
+    assert (
+        registered_calls[0].response_disposition
+        == "success_response_committed"
+    )
+    represented_response = LookupResponse(
+        contract_version="1",
+        run_id=accepted.run_id,
+        trace_id=accepted.trace_id,
+        tool_identity=registered_calls[0].tool_identity,
+        tool_call_id=registered_calls[0].tool_call_id,
+        retry_ordinal=registered_calls[0].retry_ordinal,
+        result=LookupResult(status="found", value="control-ok"),
+    )
+    represented_digest = sha256(
+        rfc8785.dumps(represented_response.model_dump(mode="json"))
+    ).hexdigest()
+    assert registered_calls[0].response_digest == represented_digest
+    assert response_evidence.event_type == "boundary.tool_result.committed"
+    assert response_evidence.caused_by_event_id == (
+        registered_calls[0].ordinal_evidence_id
+    )
+    assert response_evidence.payload["response_digest"] == (
+        represented_digest
+    )
+    assert (
+        response_evidence.payload["disposition"]
+        == "success_response_committed"
+    )
+    assert activation_count == 0
+    assert [row.event_type for row in evidence].count(
+        "boundary.tool_call.observed"
+    ) == 1
+    assert [row.event_type for row in evidence].count(
+        "boundary.tool_call.ordinal_assigned"
+    ) == 1
+    assert [row.event_type for row in evidence].count(
+        "boundary.tool_result.committed"
+    ) == 1
     target_events = [row for row in evidence if row.source == "sut"]
     assert [row.producer_seq for row in target_events] == [1, 2]
     assert [row.event_type for row in target_events] == [
@@ -221,7 +300,7 @@ async def test_real_http_contract_failures_idempotency_and_cancellation(
             ).content
         )
         for _ in range(100):
-            if status.state == "completed":
+            if status.state in {"completed", "failed"}:
                 break
             await asyncio.sleep(0.01)
             status = RunStatus.model_validate_json(
@@ -229,7 +308,7 @@ async def test_real_http_contract_failures_idempotency_and_cancellation(
                     await client.get(f"/test-runs/{run_id}")
                 ).content
             )
-        assert status.state == "completed"
+        assert status.state == "failed"
         cancellation = CancellationRequest(
             contract_version="1",
             run_id=run_id,
@@ -245,7 +324,7 @@ async def test_real_http_contract_failures_idempotency_and_cancellation(
             ).content
         )
         assert acknowledgement.cancellation_applied is False
-        assert acknowledgement.status.state == "completed"
+        assert acknowledgement.status.state == "failed"
 
 
 async def test_real_http_deadline_cancels_and_collects_terminal_watermark(
@@ -257,7 +336,8 @@ async def test_real_http_deadline_cancels_and_collects_terminal_watermark(
         run_id=accepted.run_id,
         sut_base_url=os.environ["SUT_BASE_URL"],
         tool_endpoint=(
-            f"http://boundary:8000/internal/tools/{accepted.run_id}"
+            "http://boundary:8000/internal/v1/runs/"
+            f"{accepted.run_id}/tools/phase1-lookup"
         ),
         tested_input="cancel before deterministic delayed start",
         execution_budget_ms=200,

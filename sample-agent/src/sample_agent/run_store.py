@@ -25,15 +25,18 @@ from sample_agent.contract_v1 import (
     CompletedPayload,
     EventEnvelope,
     EventPage,
+    FailedPayload,
     RunCancelledEvent,
     RunCompletedEvent,
+    RunFailedEvent,
     RunStartedEvent,
     RunStatus,
     StartedPayload,
     TerminalResult,
     TestRunRequest,
 )
-from sample_agent.graph import build_control_graph
+from sample_agent.graph import ToolLookupPort, build_control_graph
+from sample_agent.tool_client import ToolClientError
 
 
 AGENT_ID = "boundary.sample-agent"
@@ -72,6 +75,9 @@ class RunRecord:
     tested_agent_id: str
     tested_agent_version: str
     query: str
+    tool_endpoint: str
+    tool_capability: str = field(repr=False)
+    fault_id: UUID | None
     state: Literal[
         "accepted",
         "running",
@@ -97,6 +103,7 @@ class RunStore:
         *,
         max_runs: int = MAX_RETAINED_RUNS,
         start_delay_ms: int = 0,
+        tool_client: ToolLookupPort | None = None,
     ) -> None:
         if max_runs <= 0:
             raise ValueError("max_runs must be positive")
@@ -108,7 +115,7 @@ class RunStore:
         self._start_delay_seconds = start_delay_ms / 1000
         self._runs: OrderedDict[UUID, RunRecord] = OrderedDict()
         self._lock = asyncio.Lock()
-        self._graph = build_control_graph()
+        self._graph = build_control_graph(tool_client=tool_client)
 
     async def create(
         self,
@@ -132,6 +139,9 @@ class RunStore:
                 tested_agent_id=AGENT_ID,
                 tested_agent_version=VULNERABLE_VERSION,
                 query=request.tested_input.query,
+                tool_endpoint=request.tool_endpoint,
+                tool_capability=request.tool_capability,
+                fault_id=request.fault_id,
             )
             self._runs[request.run_id] = record
             return self._accepted(record), False
@@ -157,7 +167,47 @@ class RunStore:
             )
             self._append(record, started)
 
-        result = await self._graph.ainvoke({"query": record.query})
+        try:
+            result = await self._graph.ainvoke(
+                {
+                    "query": record.query,
+                    "run_id": record.run_id,
+                    "trace_id": record.trace_id,
+                    "fault_id": record.fault_id,
+                    "tool_endpoint": record.tool_endpoint,
+                    "tool_capability": record.tool_capability,
+                }
+            )
+        except (ToolClientError, ValueError):
+            async with self._lock:
+                record = self._require(run_id)
+                if record.state != "running":
+                    return
+                failed = RunFailedEvent(
+                    contract_version=CONTRACT_VERSION,
+                    run_id=record.run_id,
+                    trace_id=record.trace_id,
+                    event_id=uuid4(),
+                    source="sut",
+                    event_type="sut.run.failed",
+                    boundary="run",
+                    producer_seq=len(record.events) + 1,
+                    caused_by_event_id=record.events[-1].event_id,
+                    payload=FailedPayload(
+                        schema_version=1,
+                        error_code="TOOL_CALL_FAILED",
+                    ),
+                )
+                self._append(record, failed)
+                record.state = "failed"
+                record.error_summary = "Boundary tool call failed"
+                self._seal(
+                    record,
+                    event=failed,
+                    outcome_kind="error",
+                    output=None,
+                )
+            return
 
         async with self._lock:
             record = self._require(run_id)

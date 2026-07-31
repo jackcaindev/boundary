@@ -5,6 +5,7 @@ description = "Boundary's separate Phase 1 sample system under test"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.120.4",
+    "httpx==0.28.1",
     "langgraph==1.2.9",
     "pydantic==2.13.4",
     "uvicorn==0.38.0",
@@ -19,7 +20,6 @@ module-name = "sample_agent"
 
 [dependency-groups]
 dev = [
-    "httpx==0.28.1",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
 ]
