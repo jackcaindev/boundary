@@ -33,6 +33,7 @@ from boundary.injection.fault_spec import (
 from boundary.persistence.tables import (
     evidence_records,
     fault_activations,
+    reruns,
     run_capabilities,
     runs,
     tool_calls,
@@ -53,7 +54,7 @@ from boundary.sut.contract_v1 import (
 INJECTED_ACCEPTED_EVENT_TYPE = "boundary.run.injected_sibling_accepted"
 VULNERABLE_AGENT_VERSION = "vulnerable-v1"
 FIXED_AGENT_VERSION = "fixed-v1"
-SiblingFailurePoint = Literal["run", "evidence", "capability"]
+SiblingFailurePoint = Literal["run", "evidence", "capability", "rerun_link"]
 
 
 class InjectedSiblingError(Exception):
@@ -123,6 +124,7 @@ async def create_injected_sibling(
     *,
     control_run_id: UUID,
     expires_at: datetime,
+    rerun_id: UUID | None = None,
     _fail_after: SiblingFailurePoint | None = None,
 ) -> InjectedSibling:
     """Atomically create a fresh injected run and fault-bound capability."""
@@ -148,6 +150,25 @@ async def create_injected_sibling(
             ).one_or_none()
             if control is None:
                 raise InjectedSiblingError("control run does not exist")
+            rerun = None
+            if rerun_id is not None:
+                rerun = (
+                    await connection.execute(
+                        sa.select(reruns)
+                        .where(reruns.c.rerun_id == rerun_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if (
+                    rerun is None
+                    or rerun.control_run_id != control_run_id
+                    or rerun.campaign_id != control.campaign_id
+                    or rerun.status not in {"accepted", "running"}
+                    or rerun.candidate_run_id is not None
+                ):
+                    raise InjectedSiblingError(
+                        "rerun cannot accept an injected candidate"
+                    )
             if control.run_role != "control" or control.operational_status != "completed":
                 raise InjectedSiblingError("control run is not a successful control")
             if (
@@ -221,6 +242,13 @@ async def create_injected_sibling(
                 "trace_id": str(trace_id),
                 "transition": "injected_sibling_accepted",
             }
+            if rerun is not None:
+                evidence_payload.update(
+                    {
+                        "regression_case_id": str(rerun.regression_case_id),
+                        "rerun_id": str(rerun.rerun_id),
+                    }
+                )
             evidence_bytes = rfc8785.dumps(evidence_payload)
             await connection.execute(
                 runs.insert().values(
@@ -290,6 +318,20 @@ async def create_injected_sibling(
                 )
             )
             _raise_sibling_failure(_fail_after, "capability")
+            if rerun is not None:
+                updated = await connection.execute(
+                    reruns.update()
+                    .where(
+                        reruns.c.rerun_id == rerun.rerun_id,
+                        reruns.c.candidate_run_id.is_(None),
+                    )
+                    .values(candidate_run_id=run_id)
+                )
+                if updated.rowcount != 1:
+                    raise InjectedSiblingError(
+                        "rerun candidate linkage conflicted"
+                    )
+                _raise_sibling_failure(_fail_after, "rerun_link")
     except InjectedSiblingError:
         raise
     except IntegrityError:

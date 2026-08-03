@@ -15,11 +15,14 @@ from boundary.persistence.database import DatabaseSettings
 from boundary.persistence.tables import (
     analyses,
     campaigns,
+    comparisons,
     evidence_records,
     evidence_sets,
     fault_activations,
     idempotency_records,
     run_capabilities,
+    regression_cases,
+    reruns,
     runs,
     tool_calls,
 )
@@ -37,6 +40,9 @@ APPLICATION_TABLES = {
     "fault_activations",
     "evidence_sets",
     "analyses",
+    "regression_cases",
+    "reruns",
+    "comparisons",
 }
 
 
@@ -115,6 +121,9 @@ async def database_engine(
 
 async def _clear_application_rows(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
+        await connection.execute(comparisons.delete())
+        await connection.execute(reruns.delete())
+        await connection.execute(regression_cases.delete())
         await connection.execute(analyses.delete())
         await connection.execute(evidence_sets.delete())
         await connection.execute(fault_activations.delete())

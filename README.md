@@ -26,9 +26,11 @@ docker compose --profile test run --build --rm integration-tests
 This starts PostgreSQL, waits for the one-shot migration service to
 complete, starts the unexposed sample-agent service, and executes the
 locked Boundary suite across the private Compose application and data
-networks. The Task 4 control test uses real HTTP from the Boundary test
+networks. The Task 5–7 execution tests use real HTTP from the Boundary test
 container to the separate sample-agent container and back to Boundary's
-unpublished private tool route.
+unpublished private tool route. They include the vulnerable `FAIL`, immutable
+regression-case materialization, fresh `fixed-v1` control and injected runs,
+and the sealed scenario-scoped `PASS` comparison.
 
 The sample-agent image can be verified independently:
 

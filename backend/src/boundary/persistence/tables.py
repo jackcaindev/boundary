@@ -1,4 +1,4 @@
-"""SQLAlchemy Core metadata through Task 6 finalization and analysis."""
+"""SQLAlchemy Core metadata through Task 7 regression comparison."""
 
 from __future__ import annotations
 
@@ -855,5 +855,296 @@ analyses = sa.Table(
         "attempted_analysis_digest",
         unique=True,
         postgresql_where=sa.text("record_kind = 'integrity_failure'"),
+    ),
+)
+
+regression_cases = sa.Table(
+    "regression_cases",
+    metadata,
+    sa.Column("regression_case_id", sa.Uuid(), primary_key=True),
+    sa.Column(
+        "source_analysis_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "analyses.analysis_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "source_evidence_set_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_sets.evidence_set_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column(
+        "source_run_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "runs.run_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column("artifact_schema_version", sa.Integer(), nullable=False),
+    sa.Column(
+        "artifact",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=False,
+    ),
+    sa.Column("artifact_canonical_bytes", sa.LargeBinary(), nullable=False),
+    sa.Column("integrity_digest", sa.CHAR(64), nullable=False),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.CheckConstraint(
+        "artifact_schema_version > 0",
+        name="artifact_schema_version_positive",
+    ),
+    sa.CheckConstraint(
+        "integrity_digest ~ '^[0-9a-f]{64}$'",
+        name="integrity_digest_lower_hex",
+    ),
+)
+
+reruns = sa.Table(
+    "reruns",
+    metadata,
+    sa.Column("rerun_id", sa.Uuid(), primary_key=True),
+    sa.Column(
+        "regression_case_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "regression_cases.regression_case_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column("mode", sa.String(32), nullable=False),
+    sa.Column("requested_tested_agent_version", sa.String(256), nullable=False),
+    sa.Column(
+        "campaign_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "campaigns.campaign_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=True,
+        unique=True,
+    ),
+    sa.Column(
+        "control_run_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "runs.run_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=True,
+        unique=True,
+    ),
+    sa.Column(
+        "candidate_run_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "runs.run_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=True,
+        unique=True,
+    ),
+    sa.Column("status", sa.String(32), nullable=False),
+    sa.Column("reason_code", sa.String(128), nullable=True),
+    sa.Column("pre_report_schema_version", sa.Integer(), nullable=False),
+    sa.Column(
+        "pre_invariance_report",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=False,
+    ),
+    sa.Column("pre_invariance_canonical_bytes", sa.LargeBinary(), nullable=False),
+    sa.Column("pre_invariance_digest", sa.CHAR(64), nullable=False),
+    sa.Column("completed_report_schema_version", sa.Integer(), nullable=True),
+    sa.Column(
+        "completed_invariance_report",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=True,
+    ),
+    sa.Column("completed_invariance_canonical_bytes", sa.LargeBinary(), nullable=True),
+    sa.Column("completed_invariance_digest", sa.CHAR(64), nullable=True),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.CheckConstraint(
+        "mode IN ('reproduction', 'version_comparison')",
+        name="mode_valid",
+    ),
+    sa.CheckConstraint(
+        "status IN ('rejected', 'accepted', 'running', 'completed', 'failed')",
+        name="status_valid",
+    ),
+    sa.CheckConstraint(
+        "pre_report_schema_version > 0",
+        name="pre_report_schema_version_positive",
+    ),
+    sa.CheckConstraint(
+        "pre_invariance_digest ~ '^[0-9a-f]{64}$'",
+        name="pre_invariance_digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "(status = 'rejected' AND campaign_id IS NULL AND control_run_id IS NULL "
+        "AND candidate_run_id IS NULL AND reason_code IS NOT NULL) OR "
+        "(status <> 'rejected' AND campaign_id IS NOT NULL "
+        "AND control_run_id IS NOT NULL)",
+        name="execution_identity_lifecycle_consistent",
+    ),
+    sa.CheckConstraint(
+        "(completed_report_schema_version IS NULL "
+        "AND completed_invariance_report IS NULL "
+        "AND completed_invariance_canonical_bytes IS NULL "
+        "AND completed_invariance_digest IS NULL) OR "
+        "(completed_report_schema_version > 0 "
+        "AND completed_invariance_report IS NOT NULL "
+        "AND completed_invariance_canonical_bytes IS NOT NULL "
+        "AND completed_invariance_digest ~ '^[0-9a-f]{64}$')",
+        name="completed_invariance_consistent",
+    ),
+)
+
+comparisons = sa.Table(
+    "comparisons",
+    metadata,
+    sa.Column("comparison_id", sa.Uuid(), primary_key=True),
+    sa.Column(
+        "regression_case_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "regression_cases.regression_case_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column(
+        "rerun_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "reruns.rerun_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column(
+        "source_run_id",
+        sa.Uuid(),
+        sa.ForeignKey("runs.run_id", ondelete="RESTRICT", onupdate="RESTRICT"),
+        nullable=False,
+    ),
+    sa.Column(
+        "source_evidence_set_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_sets.evidence_set_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column(
+        "source_analysis_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "analyses.analysis_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column(
+        "candidate_run_id",
+        sa.Uuid(),
+        sa.ForeignKey("runs.run_id", ondelete="RESTRICT", onupdate="RESTRICT"),
+        nullable=True,
+    ),
+    sa.Column(
+        "candidate_evidence_set_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_sets.evidence_set_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=True,
+    ),
+    sa.Column(
+        "candidate_analysis_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "analyses.analysis_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=True,
+    ),
+    sa.Column("source_tested_agent_version", sa.String(256), nullable=False),
+    sa.Column("candidate_tested_agent_version", sa.String(256), nullable=False),
+    sa.Column("source_policy_result", sa.String(32), nullable=False),
+    sa.Column("candidate_policy_result", sa.String(32), nullable=True),
+    sa.Column("status", sa.String(32), nullable=False),
+    sa.Column("terminal_result", sa.String(32), nullable=True),
+    sa.Column("reason_code", sa.String(128), nullable=True),
+    sa.Column("summary_schema_version", sa.Integer(), nullable=True),
+    sa.Column(
+        "summary_document",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=True,
+    ),
+    sa.Column("summary_canonical_bytes", sa.LargeBinary(), nullable=True),
+    sa.Column("summary_digest", sa.CHAR(64), nullable=True),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.CheckConstraint(
+        "status IN ('pending', 'valid', 'ineligible', 'execution_error')",
+        name="status_valid",
+    ),
+    sa.CheckConstraint(
+        "source_policy_result = 'FAIL'",
+        name="source_result_fail",
+    ),
+    sa.CheckConstraint(
+        "candidate_policy_result IS NULL OR candidate_policy_result IN "
+        "('PASS', 'FAIL', 'INCOMPLETE', 'INVALID', 'EXECUTION_ERROR')",
+        name="candidate_result_valid",
+    ),
+    sa.CheckConstraint(
+        "(status = 'pending' AND terminal_result IS NULL AND reason_code IS NULL "
+        "AND summary_schema_version IS NULL AND summary_document IS NULL "
+        "AND summary_canonical_bytes IS NULL AND summary_digest IS NULL) OR "
+        "(status <> 'pending' AND terminal_result IS NOT NULL "
+        "AND reason_code IS NOT NULL AND summary_schema_version > 0 "
+        "AND summary_document IS NOT NULL AND summary_canonical_bytes IS NOT NULL "
+        "AND summary_digest ~ '^[0-9a-f]{64}$')",
+        name="terminal_content_consistent",
     ),
 )
