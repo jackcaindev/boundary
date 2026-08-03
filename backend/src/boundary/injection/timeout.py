@@ -44,8 +44,7 @@ class SystemMonotonicClock:
 
 class AsyncioMonotonicWaiter:
     async def wait_until(self, deadline_ns: int, clock: MonotonicClock) -> None:
-        remaining = deadline_ns - clock.monotonic_ns()
-        if remaining > 0:
+        while (remaining := deadline_ns - clock.monotonic_ns()) > 0:
             await asyncio.sleep(remaining / 1_000_000_000)
 
 
