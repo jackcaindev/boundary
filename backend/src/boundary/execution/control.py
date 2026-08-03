@@ -17,10 +17,13 @@ from boundary.evidence.collector import (
     EvidenceLimitExceeded,
     ForwardGap,
     IdentityMismatch,
+    RunBudgetBinding,
     collect_target_page,
     observe_terminal_watermark,
     record_cancellation_requested,
+    record_deadline_reached,
     record_reported_identity,
+    record_run_budget,
     record_safe_rejection,
     record_terminal_status,
     transition_run,
@@ -184,6 +187,18 @@ async def execute_control_run(
         tool_identity=CONTROL_TOOL_IDENTITY,
         expires_at=expires_at,
     )
+    control_clock = clock or _AsyncioClock()
+    budget_started_ns = round(control_clock.monotonic() * 1_000_000_000)
+    budget = await record_run_budget(
+        engine,
+        run_id=run.run_id,
+        trace_id=run.trace_id,
+        execution_budget_ms=execution_budget_ms,
+        budget_started_monotonic_ns=budget_started_ns,
+        deadline_monotonic_ns=(
+            budget_started_ns + execution_budget_ms * 1_000_000
+        ),
+    )
     request = TestRunRequest(
         contract_version=CONTRACT_VERSION,
         campaign_id=run.campaign_id,
@@ -198,10 +213,7 @@ async def execute_control_run(
         tool_endpoint=tool_endpoint,
         tool_capability=grant.capability_secret,
     )
-    control_clock = clock or _AsyncioClock()
-    deadline = (
-        control_clock.monotonic() + execution_budget_ms / 1000
-    )
+    deadline = budget.deadline_monotonic_ns / 1_000_000_000
     owns_client = sut_client is None
     client = sut_client or SutClient(
         sut_base_url,
@@ -223,6 +235,7 @@ async def execute_control_run(
                 http_timeout_seconds=http_timeout_seconds,
                 capability_record_id=grant.capability_record_id,
                 state=state,
+                budget=budget,
             )
         except RunDeadlineReached:
             return await _cancel_after_deadline(
@@ -237,6 +250,7 @@ async def execute_control_run(
                 http_timeout_seconds=http_timeout_seconds,
                 capability_record_id=grant.capability_record_id,
                 state=state,
+                budget=budget,
             )
         except SutTransportError:
             if control_clock.monotonic() >= deadline:
@@ -252,6 +266,7 @@ async def execute_control_run(
                     http_timeout_seconds=http_timeout_seconds,
                     capability_record_id=grant.capability_record_id,
                     state=state,
+                    budget=budget,
                 )
             raise
     except EvidenceLimitExceeded as error:
@@ -331,6 +346,7 @@ async def _execute_before_deadline(
     http_timeout_seconds: float,
     capability_record_id: UUID,
     state: _CollectionState,
+    budget: RunBudgetBinding,
     expected_outcome_kind: str = "success",
 ) -> ControlExecutionResult:
     accepted = await _deadline_request(
@@ -389,6 +405,8 @@ async def _execute_before_deadline(
             capability_record_id=capability_record_id,
             state=state,
             expected_outcome_kind=expected_outcome_kind,
+            clock=clock,
+            budget=budget,
         )
         if result is not None:
             return result
@@ -413,6 +431,7 @@ async def _cancel_after_deadline(
     http_timeout_seconds: float,
     capability_record_id: UUID,
     state: _CollectionState,
+    budget: RunBudgetBinding,
 ) -> ControlExecutionResult:
     cancellation = CancellationRequest(
         contract_version=CONTRACT_VERSION,
@@ -423,11 +442,19 @@ async def _cancel_after_deadline(
     grace_deadline = (
         run_deadline + cancellation_grace_ms / 1000
     )
+    deadline_evidence_id = await record_deadline_reached(
+        engine,
+        run_id=run.run_id,
+        trace_id=run.trace_id,
+        budget=budget,
+        observed_monotonic_ns=round(clock.monotonic() * 1_000_000_000),
+    )
     await record_cancellation_requested(
         engine,
         run_id=run.run_id,
         trace_id=run.trace_id,
         cancellation_id=cancellation.cancellation_id,
+        deadline_evidence_id=deadline_evidence_id,
         execution_budget_ms=execution_budget_ms,
     )
     acknowledged = False
@@ -493,6 +520,8 @@ async def _cancel_after_deadline(
                 acknowledged=acknowledged,
                 cancellation_applied=cancellation_applied,
                 evidence_valid=cancellation_evidence_valid,
+                clock=clock,
+                budget=budget,
             )
             if result is not None:
                 return result
@@ -520,6 +549,8 @@ async def _cancel_after_deadline(
                 acknowledged=acknowledged,
                 cancellation_applied=cancellation_applied,
                 evidence_valid=cancellation_evidence_valid,
+                clock=clock,
+                budget=budget,
             )
             if result is not None:
                 return result
@@ -663,6 +694,8 @@ async def _complete_normal_terminal(
     run,
     capability_record_id: UUID,
     state: _CollectionState,
+    clock: ControlClock,
+    budget: RunBudgetBinding,
     expected_outcome_kind: str = "success",
 ) -> ControlExecutionResult | None:
     status = state.terminal_status
@@ -694,6 +727,8 @@ async def _complete_normal_terminal(
         run_id=run.run_id,
         target_status=status.state,
         reason="terminal_watermark_collected",
+        run_budget=budget,
+        observed_monotonic_ns=round(clock.monotonic() * 1_000_000_000),
     )
     await retire_capability(engine, capability_record_id)
     return ControlExecutionResult(
@@ -716,6 +751,8 @@ async def _complete_cancelled_terminal(
     acknowledged: bool,
     cancellation_applied: bool,
     evidence_valid: bool,
+    clock: ControlClock,
+    budget: RunBudgetBinding,
 ) -> ControlExecutionResult | None:
     status = state.terminal_status
     if (
@@ -745,6 +782,8 @@ async def _complete_cancelled_terminal(
         run_id=run.run_id,
         target_status="cancelled",
         reason="cancelled_terminal_watermark_collected",
+        run_budget=budget,
+        observed_monotonic_ns=round(clock.monotonic() * 1_000_000_000),
     )
     await retire_capability(engine, capability_record_id)
     return ControlExecutionResult(

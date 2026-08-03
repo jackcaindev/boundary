@@ -13,8 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from boundary.persistence.database import DatabaseSettings
 from boundary.persistence.tables import (
+    analyses,
     campaigns,
     evidence_records,
+    evidence_sets,
     fault_activations,
     idempotency_records,
     run_capabilities,
@@ -33,6 +35,8 @@ APPLICATION_TABLES = {
     "run_capabilities",
     "tool_calls",
     "fault_activations",
+    "evidence_sets",
+    "analyses",
 }
 
 
@@ -111,6 +115,8 @@ async def database_engine(
 
 async def _clear_application_rows(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
+        await connection.execute(analyses.delete())
+        await connection.execute(evidence_sets.delete())
         await connection.execute(fault_activations.delete())
         await connection.execute(tool_calls.delete())
         await connection.execute(run_capabilities.delete())

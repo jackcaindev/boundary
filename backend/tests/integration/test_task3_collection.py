@@ -24,7 +24,9 @@ from boundary.evidence.collector import (
     collect_target_page,
     observe_terminal_watermark,
     record_cancellation_requested,
+    record_deadline_reached,
     record_reported_identity,
+    record_run_budget,
     record_safe_rejection,
     record_terminal_status,
     transition_run,
@@ -833,12 +835,28 @@ async def test_cancellation_request_evidence_is_safe_and_idempotent(
 ) -> None:
     accepted = await _accepted_run(database_engine)
     cancellation_id = uuid4()
+    budget = await record_run_budget(
+        database_engine,
+        run_id=accepted.run_id,
+        trace_id=accepted.trace_id,
+        execution_budget_ms=123,
+        budget_started_monotonic_ns=1_000,
+        deadline_monotonic_ns=123_001_000,
+    )
+    deadline_evidence_id = await record_deadline_reached(
+        database_engine,
+        run_id=accepted.run_id,
+        trace_id=accepted.trace_id,
+        budget=budget,
+        observed_monotonic_ns=123_001_000,
+    )
     for _ in range(2):
         await record_cancellation_requested(
             database_engine,
             run_id=accepted.run_id,
             trace_id=accepted.trace_id,
             cancellation_id=cancellation_id,
+            deadline_evidence_id=deadline_evidence_id,
             execution_budget_ms=123,
         )
 
@@ -857,6 +875,7 @@ async def test_cancellation_request_evidence_is_safe_and_idempotent(
     assert row.source_event_id == cancellation_id
     assert row.payload == {
         "cancellation_id": str(cancellation_id),
+        "deadline_evidence_id": str(deadline_evidence_id),
         "reason": "run_budget_expired",
         "run_budget": {
             "execution_budget_ms": 123,
@@ -876,6 +895,7 @@ async def test_cancellation_request_evidence_is_safe_and_idempotent(
             run_id=accepted.run_id,
             trace_id=accepted.trace_id,
             cancellation_id=cancellation_id,
+            deadline_evidence_id=deadline_evidence_id,
             execution_budget_ms=124,
         )
 

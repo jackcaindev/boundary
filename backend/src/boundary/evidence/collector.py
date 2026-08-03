@@ -38,6 +38,10 @@ class EvidenceInvalid(CollectionError):
     code = "INVALID_EVENT"
 
 
+class EvidenceClosed(EvidenceInvalid):
+    code = "EVIDENCE_CLOSED"
+
+
 class IdentityMismatch(EvidenceInvalid):
     code = "IDENTITY_MISMATCH"
 
@@ -68,7 +72,40 @@ class PageCollectionResult:
     identical_uncommitted_events: int
 
 
+@dataclass(frozen=True, slots=True)
+class RunBudgetBinding:
+    evidence_id: UUID
+    execution_budget_ms: int
+    budget_started_monotonic_ns: int
+    deadline_monotonic_ns: int
+
+
 async def collect_target_page(
+    engine: AsyncEngine,
+    *,
+    run_id: UUID,
+    requested_after: int,
+    page: EventPage,
+) -> PageCollectionResult:
+    """Persist a page or retain only bounded audit metadata after cutoff."""
+    try:
+        return await _collect_target_page(
+            engine,
+            run_id=run_id,
+            requested_after=requested_after,
+            page=page,
+        )
+    except EvidenceClosed:
+        await record_safe_rejection(
+            engine,
+            run_id=run_id,
+            category="late_target_page_after_finalization",
+            raw_bytes=_page_bytes(page),
+        )
+        raise
+
+
+async def _collect_target_page(
     engine: AsyncEngine,
     *,
     run_id: UUID,
@@ -267,6 +304,7 @@ async def record_cancellation_requested(
     run_id: UUID,
     trace_id: UUID,
     cancellation_id: UUID,
+    deadline_evidence_id: UUID,
     execution_budget_ms: int,
     reason: str = "run_budget_expired",
 ) -> None:
@@ -277,6 +315,7 @@ async def record_cancellation_requested(
         raise ValueError("unsupported cancellation reason")
     payload = {
         "cancellation_id": str(cancellation_id),
+        "deadline_evidence_id": str(deadline_evidence_id),
         "reason": reason,
         "run_budget": {
             "execution_budget_ms": execution_budget_ms,
@@ -292,6 +331,23 @@ async def record_cancellation_requested(
         run = await _locked_run(connection, run_id)
         if run.trace_id != trace_id:
             raise IdentityMismatch("cancellation trace identity mismatch")
+        deadline = (
+            await connection.execute(
+                sa.select(evidence_records).where(
+                    evidence_records.c.evidence_id == deadline_evidence_id,
+                    evidence_records.c.run_id == run_id,
+                    evidence_records.c.source == "boundary",
+                    evidence_records.c.event_type
+                    == "boundary.deadline.reached",
+                    evidence_records.c.disposition == "accepted",
+                )
+            )
+        ).one_or_none()
+        if deadline is None:
+            raise EvidenceInvalid("cancellation lacks deadline evidence")
+        deadline_budget = deadline.payload.get("execution_budget_ms")
+        if deadline_budget != execution_budget_ms:
+            raise EvidenceInvalid("cancellation budget conflicts with deadline")
         existing = (
             await connection.execute(
                 sa.select(
@@ -325,6 +381,86 @@ async def record_cancellation_requested(
                 source_event_id=cancellation_id,
                 producer_seq=None,
                 receipt_seq=run.next_receipt_seq,
+                caused_by_event_id=deadline_evidence_id,
+                payload_schema_version=1,
+                payload=payload,
+                payload_canonical_bytes=canonical_bytes,
+                payload_digest=digest,
+                disposition="accepted",
+            )
+        )
+        await connection.execute(
+            runs.update()
+            .where(runs.c.run_id == run_id)
+            .values(next_receipt_seq=run.next_receipt_seq + 1)
+        )
+
+
+async def record_run_budget(
+    engine: AsyncEngine,
+    *,
+    run_id: UUID,
+    trace_id: UUID,
+    execution_budget_ms: int,
+    budget_started_monotonic_ns: int,
+    deadline_monotonic_ns: int,
+) -> RunBudgetBinding:
+    """Bind the one immutable run budget before target invocation."""
+    if not 0 < execution_budget_ms <= 30_000:
+        raise ValueError("execution budget must be between 1 and 30000 ms")
+    if (
+        budget_started_monotonic_ns < 0
+        or deadline_monotonic_ns - budget_started_monotonic_ns
+        != execution_budget_ms * 1_000_000
+    ):
+        raise ValueError("run budget monotonic boundary is inconsistent")
+    payload = {
+        "budget_started_monotonic_ns": budget_started_monotonic_ns,
+        "deadline_monotonic_ns": deadline_monotonic_ns,
+        "execution_budget_ms": execution_budget_ms,
+        "relationship": "bound_before_target_invocation",
+        "run_id": str(run_id),
+        "schema_version": 1,
+        "timing_authority": "boundary_monotonic",
+        "trace_id": str(trace_id),
+    }
+    canonical_bytes = rfc8785.dumps(payload)
+    digest = sha256(canonical_bytes).hexdigest()
+    async with engine.begin() as connection:
+        run = await _locked_run(connection, run_id)
+        if run.trace_id != trace_id:
+            raise IdentityMismatch("run budget trace identity mismatch")
+        existing = (
+            await connection.execute(
+                sa.select(evidence_records).where(
+                    evidence_records.c.run_id == run_id,
+                    evidence_records.c.source == "boundary",
+                    evidence_records.c.event_type
+                    == "boundary.run_budget.bound",
+                    evidence_records.c.disposition == "accepted",
+                )
+            )
+        ).all()
+        if existing:
+            if len(existing) != 1 or existing[0].payload_digest != digest:
+                raise EvidenceInvalid("run budget is already bound differently")
+            return RunBudgetBinding(
+                evidence_id=existing[0].evidence_id,
+                execution_budget_ms=execution_budget_ms,
+                budget_started_monotonic_ns=budget_started_monotonic_ns,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+            )
+        evidence_id = uuid4()
+        await connection.execute(
+            evidence_records.insert().values(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                source="boundary",
+                event_type="boundary.run_budget.bound",
+                boundary="run",
+                source_event_id=evidence_id,
+                producer_seq=None,
+                receipt_seq=run.next_receipt_seq,
                 caused_by_event_id=None,
                 payload_schema_version=1,
                 payload=payload,
@@ -338,6 +474,97 @@ async def record_cancellation_requested(
             .where(runs.c.run_id == run_id)
             .values(next_receipt_seq=run.next_receipt_seq + 1)
         )
+    return RunBudgetBinding(
+        evidence_id=evidence_id,
+        execution_budget_ms=execution_budget_ms,
+        budget_started_monotonic_ns=budget_started_monotonic_ns,
+        deadline_monotonic_ns=deadline_monotonic_ns,
+    )
+
+
+async def record_deadline_reached(
+    engine: AsyncEngine,
+    *,
+    run_id: UUID,
+    trace_id: UUID,
+    budget: RunBudgetBinding,
+    observed_monotonic_ns: int,
+) -> UUID:
+    """Record Boundary's authoritative observation of the run deadline."""
+    if observed_monotonic_ns < budget.deadline_monotonic_ns:
+        raise ValueError("run deadline has not been reached")
+    payload = {
+        "budget_event_id": str(budget.evidence_id),
+        "deadline_monotonic_ns": budget.deadline_monotonic_ns,
+        "execution_budget_ms": budget.execution_budget_ms,
+        "observed_monotonic_ns": observed_monotonic_ns,
+        "relationship": "observed_at_or_after_deadline",
+        "run_id": str(run_id),
+        "schema_version": 1,
+        "timing_authority": "boundary_monotonic",
+        "trace_id": str(trace_id),
+    }
+    canonical_bytes = rfc8785.dumps(payload)
+    digest = sha256(canonical_bytes).hexdigest()
+    async with engine.begin() as connection:
+        run = await _locked_run(connection, run_id)
+        if run.trace_id != trace_id:
+            raise IdentityMismatch("deadline trace identity mismatch")
+        bound = (
+            await connection.execute(
+                sa.select(evidence_records).where(
+                    evidence_records.c.evidence_id == budget.evidence_id,
+                    evidence_records.c.run_id == run_id,
+                    evidence_records.c.event_type
+                    == "boundary.run_budget.bound",
+                    evidence_records.c.disposition == "accepted",
+                )
+            )
+        ).one_or_none()
+        if bound is None or bound.payload.get("execution_budget_ms") != (
+            budget.execution_budget_ms
+        ):
+            raise EvidenceInvalid("deadline lacks its authoritative budget")
+        existing = (
+            await connection.execute(
+                sa.select(evidence_records).where(
+                    evidence_records.c.run_id == run_id,
+                    evidence_records.c.source == "boundary",
+                    evidence_records.c.event_type
+                    == "boundary.deadline.reached",
+                    evidence_records.c.disposition == "accepted",
+                )
+            )
+        ).all()
+        if existing:
+            if len(existing) != 1 or existing[0].payload_digest != digest:
+                raise EvidenceInvalid("deadline evidence conflicts")
+            return existing[0].evidence_id
+        evidence_id = uuid4()
+        await connection.execute(
+            evidence_records.insert().values(
+                evidence_id=evidence_id,
+                run_id=run_id,
+                source="boundary",
+                event_type="boundary.deadline.reached",
+                boundary="run",
+                source_event_id=evidence_id,
+                producer_seq=None,
+                receipt_seq=run.next_receipt_seq,
+                caused_by_event_id=budget.evidence_id,
+                payload_schema_version=1,
+                payload=payload,
+                payload_canonical_bytes=canonical_bytes,
+                payload_digest=digest,
+                disposition="accepted",
+            )
+        )
+        await connection.execute(
+            runs.update()
+            .where(runs.c.run_id == run_id)
+            .values(next_receipt_seq=run.next_receipt_seq + 1)
+        )
+    return evidence_id
 
 
 async def record_reported_identity(
@@ -566,6 +793,8 @@ async def transition_run(
     run_id: UUID,
     target_status: str,
     reason: str,
+    run_budget: RunBudgetBinding | None = None,
+    observed_monotonic_ns: int | None = None,
 ) -> None:
     """Atomically update the projection and append Boundary evidence."""
     async with engine.begin() as connection:
@@ -586,6 +815,21 @@ async def transition_run(
             "schema_version": 1,
             "to_status": target_status,
         }
+        if run_budget is not None:
+            if observed_monotonic_ns is None:
+                raise ValueError("budgeted transition lacks an observation")
+            payload["run_budget"] = {
+                "budget_event_id": str(run_budget.evidence_id),
+                "deadline_monotonic_ns": run_budget.deadline_monotonic_ns,
+                "execution_budget_ms": run_budget.execution_budget_ms,
+                "observed_monotonic_ns": observed_monotonic_ns,
+                "relationship": (
+                    "before_deadline"
+                    if observed_monotonic_ns
+                    < run_budget.deadline_monotonic_ns
+                    else "at_or_after_deadline"
+                ),
+            }
         canonical_bytes = rfc8785.dumps(payload)
         evidence_id = uuid4()
         event_type = (
@@ -637,14 +881,24 @@ async def record_safe_rejection(
     }
     canonical_bytes = rfc8785.dumps(payload)
     async with engine.begin() as connection:
-        run = await _locked_run(connection, run_id)
+        run = await _locked_run(
+            connection,
+            run_id,
+            require_open=False,
+        )
+        disposition = "rejected" if run.evidence_open else "late"
+        event_type = (
+            "boundary.sut_event.rejected"
+            if run.evidence_open
+            else "boundary.sut_event.late_rejected"
+        )
         evidence_id = uuid4()
         await connection.execute(
             evidence_records.insert().values(
                 evidence_id=evidence_id,
                 run_id=run_id,
                 source="boundary",
-                event_type="boundary.sut_event.rejected",
+                event_type=event_type,
                 boundary="run",
                 source_event_id=evidence_id,
                 producer_seq=None,
@@ -655,7 +909,7 @@ async def record_safe_rejection(
                 payload=payload,
                 payload_canonical_bytes=canonical_bytes,
                 payload_digest=sha256(canonical_bytes).hexdigest(),
-                disposition="rejected",
+                disposition=disposition,
             )
         )
         await connection.execute(
@@ -728,6 +982,8 @@ async def _validate_causal_links(
 async def _locked_run(
     connection: AsyncConnection,
     run_id: UUID,
+    *,
+    require_open: bool = True,
 ) -> Any:
     run = (
         await connection.execute(
@@ -736,8 +992,8 @@ async def _locked_run(
     ).one_or_none()
     if run is None:
         raise IdentityMismatch("run does not exist")
-    if not run.evidence_open:
-        raise EvidenceInvalid("run evidence is closed")
+    if require_open and not run.evidence_open:
+        raise EvidenceClosed("run evidence is closed")
     return run
 
 

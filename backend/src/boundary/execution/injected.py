@@ -20,6 +20,7 @@ from boundary.evidence.collector import (
     EvidenceInvalid,
     EvidenceLimitExceeded,
     IdentityMismatch,
+    record_run_budget,
     record_safe_rejection,
 )
 from boundary.injection.capability import CAPABILITY_BYTES, CapabilityGrant
@@ -379,7 +380,18 @@ async def execute_injected_run(
         fault_id=run.fault_id,
     )
     selected_clock = clock or _AsyncioClock()
-    deadline = selected_clock.monotonic() + execution_budget_ms / 1000
+    budget_started_ns = round(selected_clock.monotonic() * 1_000_000_000)
+    budget = await record_run_budget(
+        engine,
+        run_id=run.run_id,
+        trace_id=run.trace_id,
+        execution_budget_ms=execution_budget_ms,
+        budget_started_monotonic_ns=budget_started_ns,
+        deadline_monotonic_ns=(
+            budget_started_ns + execution_budget_ms * 1_000_000
+        ),
+    )
+    deadline = budget.deadline_monotonic_ns / 1_000_000_000
     if run.expected_tested_agent_version not in {
         VULNERABLE_AGENT_VERSION,
         FIXED_AGENT_VERSION,
@@ -412,6 +424,7 @@ async def execute_injected_run(
                 capability_record_id=sibling.capability.capability_record_id,
                 state=state,
                 expected_outcome_kind=expected_outcome,
+                budget=budget,
             )
         except RunDeadlineReached:
             result = await _cancel_after_deadline(
@@ -426,6 +439,7 @@ async def execute_injected_run(
                 http_timeout_seconds=http_timeout_seconds,
                 capability_record_id=sibling.capability.capability_record_id,
                 state=state,
+                budget=budget,
             )
         await _wait_for_activation_settlement(
             engine,

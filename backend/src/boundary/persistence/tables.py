@@ -1,4 +1,4 @@
-"""SQLAlchemy Core metadata through Task 5's timeout-proof extension."""
+"""SQLAlchemy Core metadata through Task 6 finalization and analysis."""
 
 from __future__ import annotations
 
@@ -424,6 +424,16 @@ evidence_records = sa.Table(
         name="disposition_valid",
     ),
 )
+sa.Index(
+    "uq_evidence_records_run_budget",
+    evidence_records.c.run_id,
+    unique=True,
+    postgresql_where=sa.and_(
+        evidence_records.c.source == "boundary",
+        evidence_records.c.disposition == "accepted",
+        evidence_records.c.event_type == "boundary.run_budget.bound",
+    ),
+)
 
 tool_calls = sa.Table(
     "tool_calls",
@@ -687,5 +697,163 @@ fault_activations = sa.Table(
         "(hold_disposition = 'runtime_lost' AND runtime_completed_at IS NOT NULL "
         "AND runtime_completed_monotonic_ns IS NULL)",
         name="hold_completion_consistent",
+    ),
+)
+
+evidence_sets = sa.Table(
+    "evidence_sets",
+    metadata,
+    sa.Column("evidence_set_id", sa.Uuid(), primary_key=True),
+    sa.Column(
+        "run_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "runs.run_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    sa.Column("manifest_schema_version", sa.Integer(), nullable=False),
+    sa.Column("cutoff_reason", sa.String(32), nullable=False),
+    sa.Column("target_final_watermark", sa.BigInteger(), nullable=True),
+    sa.Column(
+        "manifest",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=False,
+    ),
+    sa.Column("manifest_canonical_bytes", sa.LargeBinary(), nullable=False),
+    sa.Column("evidence_set_digest", sa.CHAR(64), nullable=False),
+    sa.Column("finalizer_identity", sa.String(128), nullable=False),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.CheckConstraint(
+        "manifest_schema_version > 0",
+        name="manifest_schema_version_positive",
+    ),
+    sa.CheckConstraint(
+        "cutoff_reason IN ('target_terminal_watermark', 'evidence_deadline')",
+        name="cutoff_reason_valid",
+    ),
+    sa.CheckConstraint(
+        "target_final_watermark IS NULL OR target_final_watermark >= 0",
+        name="target_final_watermark_nonnegative",
+    ),
+    sa.CheckConstraint(
+        "evidence_set_digest ~ '^[0-9a-f]{64}$'",
+        name="digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "finalizer_identity <> ''",
+        name="finalizer_identity_not_empty",
+    ),
+)
+
+analyses = sa.Table(
+    "analyses",
+    metadata,
+    sa.Column("analysis_id", sa.Uuid(), primary_key=True),
+    sa.Column("record_kind", sa.String(32), nullable=False),
+    sa.Column(
+        "evidence_set_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "evidence_sets.evidence_set_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    sa.Column("evidence_set_digest", sa.CHAR(64), nullable=False),
+    sa.Column("analyzer_version", sa.String(128), nullable=False),
+    sa.Column("assertion_set_version", sa.String(128), nullable=False),
+    sa.Column("policy_version", sa.String(128), nullable=False),
+    sa.Column("evaluability_aggregate", sa.String(32), nullable=False),
+    sa.Column("policy_result", sa.String(32), nullable=False),
+    sa.Column("analysis_schema_version", sa.Integer(), nullable=False),
+    sa.Column(
+        "analysis_document",
+        postgresql.JSONB(astext_type=sa.Text()),
+        nullable=False,
+    ),
+    sa.Column("analysis_canonical_bytes", sa.LargeBinary(), nullable=False),
+    sa.Column("analysis_digest", sa.CHAR(64), nullable=False),
+    sa.Column(
+        "prior_analysis_id",
+        sa.Uuid(),
+        sa.ForeignKey(
+            "analyses.analysis_id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=True,
+    ),
+    sa.Column("attempted_analysis_digest", sa.CHAR(64), nullable=True),
+    sa.Column(
+        "created_at",
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
+    ),
+    sa.CheckConstraint(
+        "record_kind IN ('authoritative', 'integrity_failure')",
+        name="record_kind_valid",
+    ),
+    sa.CheckConstraint(
+        "evidence_set_digest ~ '^[0-9a-f]{64}$'",
+        name="evidence_set_digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "analysis_digest ~ '^[0-9a-f]{64}$'",
+        name="analysis_digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "attempted_analysis_digest IS NULL OR "
+        "attempted_analysis_digest ~ '^[0-9a-f]{64}$'",
+        name="attempted_digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "analysis_schema_version > 0",
+        name="analysis_schema_version_positive",
+    ),
+    sa.CheckConstraint(
+        "evaluability_aggregate IN "
+        "('EVALUABLE', 'INCOMPLETE', 'INVALID', 'EXECUTION_ERROR')",
+        name="evaluability_aggregate_valid",
+    ),
+    sa.CheckConstraint(
+        "policy_result IN "
+        "('PASS', 'FAIL', 'INCOMPLETE', 'INVALID', 'EXECUTION_ERROR')",
+        name="policy_result_valid",
+    ),
+    sa.CheckConstraint(
+        "(record_kind = 'authoritative' AND prior_analysis_id IS NULL "
+        "AND attempted_analysis_digest IS NULL) OR "
+        "(record_kind = 'integrity_failure' AND prior_analysis_id IS NOT NULL "
+        "AND attempted_analysis_digest IS NOT NULL "
+        "AND evaluability_aggregate = 'EXECUTION_ERROR' "
+        "AND policy_result = 'EXECUTION_ERROR')",
+        name="record_kind_fields_consistent",
+    ),
+    sa.Index(
+        "uq_analyses_authoritative_key",
+        "evidence_set_digest",
+        "analyzer_version",
+        "assertion_set_version",
+        "policy_version",
+        unique=True,
+        postgresql_where=sa.text("record_kind = 'authoritative'"),
+    ),
+    sa.Index(
+        "uq_analyses_integrity_attempt",
+        "prior_analysis_id",
+        "attempted_analysis_digest",
+        unique=True,
+        postgresql_where=sa.text("record_kind = 'integrity_failure'"),
     ),
 )
