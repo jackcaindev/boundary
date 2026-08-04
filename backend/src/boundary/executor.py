@@ -27,6 +27,7 @@ from boundary.execution.injected import create_injected_sibling, execute_injecte
 from boundary.injection.capability import retire_capability
 from boundary.injection.timeout import reconcile_abandoned_activation_runtimes
 from boundary.persistence.tables import (
+    analyses,
     campaigns,
     evidence_records,
     evidence_sets,
@@ -325,6 +326,7 @@ class SerialExecutor:
             self.engine, run_id=injected_run_id
         )
         await self._checkpoint(injected_run_id, "finalized")
+        self._raise_process_loss("bundled_injected_finalized")
         if await self._cancelled(campaign_id):
             await analyze_evidence_set(
                 self.engine,
@@ -574,29 +576,54 @@ class SerialExecutor:
                 )
             ).all()
         for run in run_rows:
-            if not run.evidence_open or run.operational_status not in {
+            if run.operational_status not in {
                 "cancelled",
                 "timed_out",
+                "completed",
+                "failed",
+                "invalid",
             }:
                 continue
             cutoff = (
                 "target_terminal_watermark"
                 if run.target_final_watermark is not None
                 and run.target_producer_cursor == run.target_final_watermark
-                and run.operational_status == "cancelled"
+                and run.operational_status in {"cancelled", "completed", "failed"}
                 else "cancellation_grace"
             )
             try:
-                finalized = await finalize_run_evidence(
-                    self.engine,
-                    run_id=run.run_id,
-                    cutoff_reason=cutoff,
-                )
-                if run.run_role == "injected":
-                    await analyze_evidence_set(
+                if run.evidence_open:
+                    finalized = await finalize_run_evidence(
                         self.engine,
-                        evidence_set_id=finalized.evidence_set_id,
+                        run_id=run.run_id,
+                        cutoff_reason=cutoff,
                     )
+                    evidence_set_id = finalized.evidence_set_id
+                else:
+                    async with self.engine.connect() as connection:
+                        evidence_set_id = await connection.scalar(
+                            sa.select(evidence_sets.c.evidence_set_id).where(
+                                evidence_sets.c.run_id == run.run_id
+                            )
+                        )
+                if run.run_role == "injected":
+                    if evidence_set_id is None:
+                        raise RuntimeError(
+                            "cancelled injected run lacks finalized evidence"
+                        )
+                    async with self.engine.connect() as connection:
+                        existing_analysis = await connection.scalar(
+                            sa.select(analyses.c.analysis_id).where(
+                                analyses.c.evidence_set_id == evidence_set_id,
+                                analyses.c.record_kind == "authoritative",
+                            )
+                        )
+                    if existing_analysis is None:
+                        await analyze_evidence_set(
+                            self.engine,
+                            evidence_set_id=evidence_set_id,
+                        )
+                    await self._checkpoint(run.run_id, "analyzed")
             except Exception:
                 pass
         await self._cancel_pending_campaign(campaign_id)

@@ -40,7 +40,12 @@ from sample_agent.contract_v1 import (
     TestRunRequest,
 )
 from sample_agent.graph import ToolLookupPort, build_control_graph
-from sample_agent.model import EXPECTED_TOOL
+from sample_agent.model import (
+    EXPECTED_TOOL,
+    DeterministicFakeModel,
+    ModelSelectionError,
+    ToolSelectionModel,
+)
 from sample_agent.tool_client import Phase1ToolClient, ToolClientError
 from sample_agent.versions.fixed import (
     FIXED_DEGRADED_RESULT_V1,
@@ -121,6 +126,7 @@ class RunStore:
         max_runs: int = MAX_RETAINED_RUNS,
         start_delay_ms: int = 0,
         tool_client: ToolLookupPort | None = None,
+        model: ToolSelectionModel | None = None,
     ) -> None:
         if max_runs <= 0:
             raise ValueError("max_runs must be positive")
@@ -132,8 +138,16 @@ class RunStore:
         self._start_delay_seconds = start_delay_ms / 1000
         self._runs: OrderedDict[UUID, RunRecord] = OrderedDict()
         self._lock = asyncio.Lock()
-        self._graph = build_control_graph(tool_client=tool_client)
+        self._model = model or DeterministicFakeModel()
+        self._graph = build_control_graph(
+            model=self._model,
+            tool_client=tool_client,
+        )
         self._tool_client = tool_client or Phase1ToolClient()
+
+    @property
+    def model_identity(self) -> str:
+        return self._model.model_identity
 
     async def create(
         self,
@@ -285,7 +299,7 @@ class RunStore:
                 raise ValueError("tested-agent version is unsupported")
         except RunCancelledDuringExecution:
             return
-        except (ToolClientError, ValueError):
+        except (ModelSelectionError, ToolClientError, ValueError) as error:
             async with self._lock:
                 record = self._require(run_id)
                 if record.state != "running":
@@ -302,12 +316,20 @@ class RunStore:
                     caused_by_event_id=record.events[-1].event_id,
                     payload=FailedPayload(
                         schema_version=1,
-                        error_code="TOOL_CALL_FAILED",
+                        error_code=(
+                            "MODEL_SELECTION_FAILED"
+                            if isinstance(error, ModelSelectionError)
+                            else "TOOL_CALL_FAILED"
+                        ),
                     ),
                 )
                 self._append(record, failed)
                 record.state = "failed"
-                record.error_summary = "Boundary tool call failed"
+                record.error_summary = (
+                    "Model selection failed"
+                    if isinstance(error, ModelSelectionError)
+                    else "Boundary tool call failed"
+                )
                 self._seal(
                     record,
                     event=failed,

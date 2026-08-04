@@ -7,7 +7,11 @@ from uuid import UUID
 
 from langgraph.graph import END, START, StateGraph
 
-from sample_agent.model import EXPECTED_TOOL, DeterministicFakeModel
+from sample_agent.model import (
+    EXPECTED_TOOL,
+    DeterministicFakeModel,
+    ToolSelectionModel,
+)
 from sample_agent.tool_contract_v1 import LookupResponse
 
 
@@ -37,15 +41,15 @@ class ToolLookupPort(Protocol):
 
 
 def build_control_graph(
-    model: DeterministicFakeModel | None = None,
+    model: ToolSelectionModel | None = None,
     tool_client: ToolLookupPort | None = None,
 ):
     """Compile only the model-controlled initial tool selection."""
-    fake_model = model or DeterministicFakeModel()
+    selection_model = model or DeterministicFakeModel()
     del tool_client
 
     async def select_tool(state: ControlState) -> ControlState:
-        selection = await fake_model.select_tool(state["query"])
+        selection = await selection_model.select_tool(state["query"])
         return {
             "selected_tool": selection.tool,
             "selected_arguments": selection.arguments,

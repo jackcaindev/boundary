@@ -1,0 +1,19 @@
+services:
+  sample-agent:
+    environment:
+      MODEL_MODE: openai
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-luna}
+      MODEL_REQUEST_TIMEOUT_MS: ${MODEL_REQUEST_TIMEOUT_MS:-10000}
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+    secrets:
+      - openai_api_key
+    networks:
+      - app
+      - provider-egress
+
+secrets:
+  openai_api_key:
+    file: ./.secrets/openai_api_key
+
+networks:
+  provider-egress:

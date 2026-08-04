@@ -28,6 +28,7 @@ from sample_agent.run_store import (
     RunStore,
     StoreCapacityExceeded,
 )
+from sample_agent.model import ModelSettings, build_model
 from sample_agent.versions.fixed import FIXED_VERSION
 from sample_agent.versions.vulnerable import VULNERABLE_VERSION
 
@@ -79,7 +80,8 @@ def create_app(
             "status": "ok",
             "contract_versions": [CONTRACT_VERSION],
             "tested_agent_versions": [VULNERABLE_VERSION, FIXED_VERSION],
-            "model_mode": "fake",
+            "model_mode": app.state.run_store.model_identity.split("/", 1)[0],
+            "model_identity": app.state.run_store.model_identity,
         }
 
     @app.post("/test-runs")
@@ -251,7 +253,11 @@ def _configured_store() -> RunStore:
         start_delay_ms = int(raw_delay)
     except ValueError:
         start_delay_ms = -1
-    return RunStore(start_delay_ms=start_delay_ms)
+    model_settings = ModelSettings.from_environment()
+    return RunStore(
+        start_delay_ms=start_delay_ms,
+        model=build_model(model_settings),
+    )
 
 
 app = create_app(store=_configured_store())

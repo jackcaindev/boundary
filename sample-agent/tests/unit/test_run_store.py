@@ -17,6 +17,7 @@ from sample_agent.run_store import (
     PayloadLimitExceeded,
     StoreCapacityExceeded,
 )
+from sample_agent.model import ModelSelectionError
 
 
 def _started(sequence: int) -> RunStartedEvent:
@@ -135,3 +136,26 @@ async def test_process_local_run_retention_is_bounded() -> None:
         )
 
     assert MAX_RETAINED_RUNS == 128
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_is_a_safe_bounded_terminal_state() -> None:
+    class FailingModel:
+        model_identity = "openai/gpt-test"
+
+        async def select_tool(self, query: str):
+            del query
+            raise ModelSelectionError("raw provider detail must not escape")
+
+    store = control_store(model=FailingModel())
+    await store.create(control_request())
+
+    await store.execute(RUN_ID)
+
+    status = await store.status(RUN_ID)
+    assert status.state == "failed"
+    assert status.error_summary == "Model selection failed"
+    assert status.terminal_result is not None
+    assert status.terminal_result.output is None
+    page = await store.events(RUN_ID, 0)
+    assert page.events[-1].payload.error_code == "MODEL_SELECTION_FAILED"

@@ -1,0 +1,15 @@
+{
+  "name": "boundary-compose-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  }
+}

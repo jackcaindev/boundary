@@ -639,6 +639,71 @@ async def test_startup_repairs_legacy_open_queued_cancellation(
     assert capability_state == "retired"
 
 
+async def test_cancel_recovery_analyzes_already_finalized_injected_run(
+    database_engine: AsyncEngine,
+) -> None:
+    accepted = await _accepted(database_engine)
+    crashing = _executor(
+        database_engine,
+        fail_after="bundled_injected_finalized",
+    )
+    assert await crashing._claim_oldest() == accepted.campaign_id
+    with pytest.raises(SimulatedProcessLoss, match="simulated process loss"):
+        await crashing._process(accepted.campaign_id)
+
+    await cancel_campaign(
+        database_engine,
+        campaign_id=accepted.campaign_id,
+        key=f"finalized-injected-cancel-{uuid4()}",
+    )
+    await _executor(database_engine)._settle_cancelled_campaign(
+        accepted.campaign_id
+    )
+
+    async with database_engine.connect() as connection:
+        campaign = (
+            await connection.execute(
+                sa.select(campaigns).where(
+                    campaigns.c.campaign_id == accepted.campaign_id
+                )
+            )
+        ).one()
+        injected = (
+            await connection.execute(
+                sa.select(runs).where(
+                    runs.c.campaign_id == accepted.campaign_id,
+                    runs.c.run_role == "injected",
+                )
+            )
+        ).one()
+        evidence_set = (
+            await connection.execute(
+                sa.select(evidence_sets).where(
+                    evidence_sets.c.run_id == injected.run_id
+                )
+            )
+        ).one()
+        analysis = (
+            await connection.execute(
+                sa.select(analyses).where(
+                    analyses.c.evidence_set_id
+                    == evidence_set.evidence_set_id,
+                    analyses.c.record_kind == "authoritative",
+                )
+            )
+        ).one()
+
+    assert campaign.status == "cancelled"
+    assert injected.evidence_open is False
+    assert injected.execution_checkpoint == "analyzed"
+    assert analysis.policy_result in {
+        "INCOMPLETE",
+        "INVALID",
+        "EXECUTION_ERROR",
+        "FAIL",
+    }
+
+
 @pytest.mark.parametrize(
     ("fail_after", "expected_budgets"),
     [
