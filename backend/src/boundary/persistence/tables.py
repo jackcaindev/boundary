@@ -34,6 +34,16 @@ campaigns = sa.Table(
         nullable=False,
         server_default=sa.false(),
     ),
+    sa.Column("cancellation_id", sa.Uuid(), nullable=True, unique=True),
+    sa.Column("cancel_requested_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("failure_reason", sa.String(128), nullable=True),
+    sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column(
+        "executor_managed",
+        sa.Boolean(),
+        nullable=False,
+        server_default=sa.false(),
+    ),
     sa.Column(
         "created_at",
         sa.DateTime(timezone=True),
@@ -53,6 +63,19 @@ campaigns = sa.Table(
         "current_step <> ''",
         name="current_step_not_empty",
     ),
+    sa.CheckConstraint(
+        "(NOT cancel_requested AND cancellation_id IS NULL AND "
+        "cancel_requested_at IS NULL) OR "
+        "(cancel_requested AND cancellation_id IS NOT NULL AND "
+        "cancel_requested_at IS NOT NULL)",
+        name="cancellation_consistent",
+    ),
+)
+sa.Index(
+    "ix_campaigns_executor_order",
+    campaigns.c.status,
+    campaigns.c.created_at,
+    campaigns.c.campaign_id,
 )
 
 runs = sa.Table(
@@ -156,6 +179,13 @@ runs = sa.Table(
         server_default=sa.true(),
     ),
     sa.Column(
+        "execution_checkpoint",
+        sa.String(32),
+        nullable=False,
+        server_default=sa.text("'not_started'"),
+    ),
+    sa.Column("reconciliation_reason", sa.String(128), nullable=True),
+    sa.Column(
         "created_at",
         sa.DateTime(timezone=True),
         nullable=False,
@@ -205,6 +235,11 @@ runs = sa.Table(
     sa.CheckConstraint(
         "control_run_id IS NULL OR control_run_id <> run_id",
         name="control_run_not_self",
+    ),
+    sa.CheckConstraint(
+        "execution_checkpoint IN ('not_started', 'target_interaction', "
+        "'polling', 'finalized', 'analyzed')",
+        name="execution_checkpoint_valid",
     ),
     sa.CheckConstraint(
         "(run_role = 'control' AND control_run_id IS NULL AND "
@@ -301,8 +336,7 @@ idempotency_records = sa.Table(
             deferrable=True,
             initially="DEFERRED",
         ),
-        nullable=False,
-        unique=True,
+        nullable=True,
     ),
     sa.Column(
         "run_id",
@@ -314,8 +348,14 @@ idempotency_records = sa.Table(
             deferrable=True,
             initially="DEFERRED",
         ),
+        nullable=True,
+    ),
+    sa.Column("resource_kind", sa.String(32), nullable=False),
+    sa.Column("resource_id", sa.Uuid(), nullable=False),
+    sa.Column(
+        "resource_links",
+        postgresql.JSONB(astext_type=sa.Text()),
         nullable=False,
-        unique=True,
     ),
     sa.Column(
         "created_at",
@@ -334,6 +374,15 @@ idempotency_records = sa.Table(
     sa.CheckConstraint(
         "request_digest ~ '^[0-9a-f]{64}$'",
         name="request_digest_lower_hex",
+    ),
+    sa.CheckConstraint(
+        "resource_kind IN ('campaign', 'regression_case', 'rerun', "
+        "'cancellation')",
+        name="resource_kind_valid",
+    ),
+    sa.CheckConstraint(
+        "jsonb_typeof(resource_links) = 'object'",
+        name="resource_links_object",
     ),
 )
 
@@ -737,7 +786,9 @@ evidence_sets = sa.Table(
         name="manifest_schema_version_positive",
     ),
     sa.CheckConstraint(
-        "cutoff_reason IN ('target_terminal_watermark', 'evidence_deadline')",
+        "cutoff_reason IN ('target_terminal_watermark', "
+        "'evidence_deadline', 'cancellation_grace', "
+        "'reconciliation_error')",
         name="cutoff_reason_valid",
     ),
     sa.CheckConstraint(

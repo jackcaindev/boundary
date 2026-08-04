@@ -10,6 +10,8 @@ from uuid import UUID, uuid4
 import pytest
 import rfc8785
 import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -40,7 +42,11 @@ from boundary.persistence.transactions import (
     prepare_campaign_run_acceptance,
 )
 
-from conftest import APPLICATION_TABLES, MigrationFacts
+from conftest import (
+    ALEMBIC_CONFIG_PATH,
+    APPLICATION_TABLES,
+    MigrationFacts,
+)
 
 
 pytestmark = [
@@ -145,9 +151,90 @@ async def test_clean_migration_reaches_the_single_head(
     assert migration_facts.tables_after_upgrade == APPLICATION_TABLES
     assert (
         migration_facts.database_revision
-        == "0006_regression_comparison"
+        == "0007_executor_public_api"
     )
     assert migration_facts.database_revision == migration_facts.head_revision
+
+
+async def test_0007_downgrade_removes_task8_only_idempotency_mapping(
+    database_engine: AsyncEngine,
+    acceptance_command: AcceptanceCommand,
+) -> None:
+    accepted = await accept_campaign_run(
+        database_engine,
+        prepare_campaign_run_acceptance(acceptance_command),
+    )
+    cancellation_id = uuid4()
+    async with database_engine.begin() as connection:
+        await connection.execute(
+            idempotency_records.insert().values(
+                operation_kind="campaign.cancel",
+                idempotency_key="downgrade-cancellation",
+                request_digest="1" * 64,
+                campaign_id=accepted.campaign_id,
+                run_id=None,
+                resource_kind="cancellation",
+                resource_id=cancellation_id,
+                resource_links={
+                    "campaign_id": str(accepted.campaign_id),
+                    "cancellation_id": str(cancellation_id),
+                },
+            )
+        )
+    config = Config(str(ALEMBIC_CONFIG_PATH))
+    try:
+        await asyncio.to_thread(
+            command.downgrade,
+            config,
+            "0006_regression_comparison",
+        )
+        async with database_engine.connect() as connection:
+            revision = await connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            )
+            mapping_count = await connection.scalar(
+                sa.text("SELECT count(*) FROM idempotency_records")
+            )
+            resource_column_count = await connection.scalar(
+                sa.text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = 'public' "
+                    "AND table_name = 'idempotency_records' "
+                    "AND column_name = 'resource_kind'"
+                )
+            )
+        assert revision == "0006_regression_comparison"
+        assert mapping_count == 1
+        assert resource_column_count == 0
+    finally:
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+
+async def test_0007_downgrade_rejects_durable_task8_lifecycle_state(
+    database_engine: AsyncEngine,
+    acceptance_command: AcceptanceCommand,
+) -> None:
+    await accept_campaign_run(
+        database_engine,
+        prepare_campaign_run_acceptance(
+            replace(acceptance_command, executor_managed=True)
+        ),
+    )
+    config = Config(str(ALEMBIC_CONFIG_PATH))
+    with pytest.raises(
+        RuntimeError,
+        match="unsupported while Task 8 lifecycle state exists",
+    ):
+        await asyncio.to_thread(
+            command.downgrade,
+            config,
+            "0006_regression_comparison",
+        )
+    async with database_engine.connect() as connection:
+        revision = await connection.scalar(
+            sa.text("SELECT version_num FROM alembic_version")
+        )
+    assert revision == "0007_executor_public_api"
 
 
 async def test_accepts_campaign_run_and_initial_transition_atomically(

@@ -140,6 +140,36 @@ def test_every_test_definition_drift_is_a_pre_invocation_mismatch(
     )
 
 
+def test_normalized_fault_definition_drift_is_an_explicit_mismatch() -> None:
+    artifact = _artifact()
+    drifted_fault = artifact.fault_definition.model_copy(
+        update={"injected_hold_ms": 999}
+    )
+    proposed = definition_from_artifact(
+        artifact, tested_agent_version="fixed-v1"
+    ).model_copy(update={"fault_definition": drifted_fault})
+
+    report = build_pre_invocation_report(
+        rerun_id=uuid4(),
+        artifact=artifact,
+        mode="version_comparison",
+        proposed=proposed,
+    )
+
+    definition_row = next(
+        row
+        for row in report.rows
+        if row.field_identifier == "fault_definition"
+    )
+    digest_row = next(
+        row
+        for row in report.rows
+        if row.field_identifier == "fault_definition_digest"
+    )
+    assert definition_row.result == "MISMATCH"
+    assert digest_row.result == "MATCH"
+
+
 def test_version_mode_rules_are_explicit() -> None:
     artifact = _artifact()
     same = definition_from_artifact(

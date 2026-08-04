@@ -54,3 +54,41 @@ bytes have this lowercase SHA-256 digest:
 ```text
 13c5a1d3a7ebe65a9fc2a4c834a216c32839239e77ee8d4e7f6aad711452e1ba
 ```
+
+## Task 8 headless API
+
+Boundary runs one PostgreSQL-backed serial executor inside the single FastAPI
+process. Public mutations commit before returning and require an
+`Idempotency-Key`; accepted execution continues asynchronously.
+
+The Phase 1 workflow starts with:
+
+```console
+curl -i -X POST \
+  -H 'Idempotency-Key: bundled-demo-1' \
+  -H 'Content-Type: application/json' \
+  -d '{}' \
+  http://boundary:8000/api/v1/campaigns/bundled-tool-timeout
+```
+
+Poll the returned campaign URL, inspect its run and ordered evidence links,
+then submit `{"mode":"version_comparison","tested_agent_version":"fixed-v1"}`
+to the returned regression case's `/reruns` endpoint with a new idempotency
+key. Liveness is `/health/live`; readiness is `/health/ready` and requires the
+`0007_executor_public_api` migration, PostgreSQL, completed startup
+reconciliation, valid immutable timing configuration, and a running executor.
+
+The supported Boundary settings are `DATABASE_URL`, `SUT_BASE_URL`,
+`BOUNDARY_INTERNAL_BASE_URL`, `RUN_DEADLINE_MS`, `CANCELLATION_GRACE_MS`,
+`TARGET_POLL_INTERVAL_MS`, `TOOL_CLIENT_TIMEOUT_MS`, `INJECTED_HOLD_MS`,
+`MAX_EVENT_BYTES`, `MAX_TARGET_EVENTS`, `MAX_TARGET_EVENT_BYTES`, and
+`LOG_LEVEL`. Phase 1 timing and evidence-limit values must exactly match the
+reviewed scenario; changing them makes Boundary unready. Run exactly one
+Boundary process and one ASGI worker.
+
+Migration `0007_executor_public_api` may be downgraded only when no Task 8
+executor-managed campaign, cancellation/reconciliation evidence cutoff, or
+ambiguous nonterminal execution checkpoint exists. The downgrade removes
+Task 8-only non-campaign idempotency mappings before restoring Task 7
+constraints and fails explicitly rather than discarding durable lifecycle or
+immutable evidence state.

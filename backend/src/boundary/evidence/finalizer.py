@@ -34,7 +34,12 @@ from boundary.persistence.tables import (
 
 
 FINALIZER_IDENTITY = "boundary.phase1.evidence-finalizer/v1"
-CutoffReason = Literal["target_terminal_watermark", "evidence_deadline"]
+CutoffReason = Literal[
+    "target_terminal_watermark",
+    "evidence_deadline",
+    "cancellation_grace",
+    "reconciliation_error",
+]
 FinalizationFailurePoint = Literal["evidence_closed", "evidence_set"]
 
 
@@ -86,6 +91,8 @@ async def finalize_run_evidence(
     if cutoff_reason not in {
         "target_terminal_watermark",
         "evidence_deadline",
+        "cancellation_grace",
+        "reconciliation_error",
     }:
         raise ValueError("cutoff reason is unsupported")
 
@@ -124,7 +131,11 @@ async def finalize_run_evidence(
                 )
 
             await _verify_cutoff(connection, run, cutoff_reason)
-            await _verify_boundary_work_settled(connection, run)
+            await _verify_boundary_work_settled(
+                connection,
+                run,
+                cutoff_reason=cutoff_reason,
+            )
             manifest = await _build_manifest(
                 connection,
                 run=run,
@@ -245,17 +256,61 @@ async def _verify_cutoff(
             raise FinalizationNotReady(
                 "terminal cutoff evidence is not complete"
             )
-    elif run.operational_status not in {
-        "failed",
-        "cancelled",
-        "timed_out",
-        "invalid",
-    }:
-        raise FinalizationNotReady(
-            "evidence-deadline cutoff requires a non-success terminal state"
-        )
-    else:
+    elif cutoff_reason == "evidence_deadline":
+        if run.operational_status not in {
+            "failed",
+            "cancelled",
+            "timed_out",
+            "invalid",
+        }:
+            raise FinalizationNotReady(
+                "evidence-deadline cutoff requires a non-success terminal state"
+            )
         await _verify_deadline_proof(connection, run)
+    elif cutoff_reason == "cancellation_grace":
+        if run.operational_status not in {"cancelled", "timed_out"}:
+            raise FinalizationNotReady(
+                "cancellation-grace cutoff requires cancellation terminal state"
+            )
+        cancellation_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(evidence_records)
+            .where(
+                evidence_records.c.run_id == run.run_id,
+                evidence_records.c.source == "boundary",
+                evidence_records.c.disposition == "accepted",
+                evidence_records.c.event_type.in_(
+                    [
+                        "boundary.campaign_cancellation.requested",
+                        "boundary.cancellation.requested",
+                    ]
+                ),
+            )
+        )
+        if not cancellation_count:
+            raise FinalizationNotReady(
+                "cancellation-grace cutoff lacks cancellation evidence"
+            )
+    else:
+        if run.operational_status not in {"failed", "invalid"}:
+            raise FinalizationNotReady(
+                "reconciliation-error cutoff requires failed or invalid state"
+            )
+        reconciliation_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(evidence_records)
+            .where(
+                evidence_records.c.run_id == run.run_id,
+                evidence_records.c.source == "boundary",
+                evidence_records.c.disposition == "accepted",
+                evidence_records.c.event_type
+                == "boundary.reconciliation.execution_error",
+            )
+        )
+        if not reconciliation_count:
+            raise FinalizationNotReady(
+                "reconciliation-error cutoff lacks reconciliation evidence"
+            )
 
 
 async def _verify_deadline_proof(connection: AsyncConnection, run) -> None:
@@ -327,6 +382,8 @@ async def _verify_deadline_proof(connection: AsyncConnection, run) -> None:
 async def _verify_boundary_work_settled(
     connection: AsyncConnection,
     run,
+    *,
+    cutoff_reason: CutoffReason,
 ) -> None:
     capability = (
         await connection.execute(
@@ -359,6 +416,13 @@ async def _verify_boundary_work_settled(
     activation_by_call = {row.tool_call_id: row for row in activations}
     for activation in activations:
         if (
+            cutoff_reason == "reconciliation_error"
+            and activation.reservation_state == "pre_effect_reserved"
+            and activation.effect_status == "not_started"
+            and activation.hold_disposition is None
+        ):
+            continue
+        if (
             activation.reservation_state
             in {"pre_effect_reserved", "activation_started"}
             or activation.effect_status in {"not_started", "pending"}
@@ -377,7 +441,17 @@ async def _verify_boundary_work_settled(
         if call.response_disposition == "success_response_committed":
             continue
         activation = activation_by_call.get(call.tool_call_id)
-        if activation is None or activation.hold_disposition is None:
+        unstarted_reconciliation = (
+            cutoff_reason == "reconciliation_error"
+            and activation is not None
+            and activation.reservation_state == "pre_effect_reserved"
+            and activation.effect_status == "not_started"
+            and activation.hold_disposition is None
+        )
+        if activation is None or (
+            activation.hold_disposition is None
+            and not unstarted_reconciliation
+        ):
             raise FinalizationNotReady("tool response disposition is unsettled")
 
 
@@ -446,6 +520,9 @@ async def _build_manifest(
             connection,
             run_id=run.run_id,
             evidence_by_id={row.evidence_id: row for row in accepted_rows},
+            allow_unstarted_reservations=(
+                cutoff_reason == "reconciliation_error"
+            ),
         )
     except (ActivationBindingError, ValueError, TypeError):
         raise FinalizationNotReady(
@@ -524,8 +601,12 @@ async def _cutoff_markers(
         )
 
     for row in accepted_rows:
-        if row.event_type in {"boundary.execution.error", "sut.run.failed"}:
-            reason = row.payload.get("reason")
+        if row.event_type in {
+            "boundary.execution.error",
+            "boundary.reconciliation.execution_error",
+            "sut.run.failed",
+        }:
+            reason = row.payload.get("reason") or row.payload.get("reason_code")
             if reason is None and isinstance(row.payload.get("payload"), dict):
                 reason = row.payload["payload"].get("error_code")
             markers.append(

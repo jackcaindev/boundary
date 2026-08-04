@@ -304,22 +304,28 @@ async def record_cancellation_requested(
     run_id: UUID,
     trace_id: UUID,
     cancellation_id: UUID,
-    deadline_evidence_id: UUID,
+    deadline_evidence_id: UUID | None,
     execution_budget_ms: int,
     reason: str = "run_budget_expired",
 ) -> None:
     """Append one safe Boundary cancellation request idempotently."""
     if not 0 < execution_budget_ms <= 30_000:
         raise ValueError("execution budget must be between 1 and 30000 ms")
-    if reason != "run_budget_expired":
+    if reason not in {"run_budget_expired", "public_campaign_cancellation"}:
         raise ValueError("unsupported cancellation reason")
     payload = {
         "cancellation_id": str(cancellation_id),
-        "deadline_evidence_id": str(deadline_evidence_id),
+        "deadline_evidence_id": (
+            str(deadline_evidence_id) if deadline_evidence_id else None
+        ),
         "reason": reason,
         "run_budget": {
             "execution_budget_ms": execution_budget_ms,
-            "relationship": "requested_after_expiry",
+            "relationship": (
+                "requested_after_expiry"
+                if reason == "run_budget_expired"
+                else "requested_by_campaign"
+            ),
         },
         "run_id": str(run_id),
         "schema_version": 1,
@@ -331,23 +337,30 @@ async def record_cancellation_requested(
         run = await _locked_run(connection, run_id)
         if run.trace_id != trace_id:
             raise IdentityMismatch("cancellation trace identity mismatch")
-        deadline = (
-            await connection.execute(
-                sa.select(evidence_records).where(
-                    evidence_records.c.evidence_id == deadline_evidence_id,
-                    evidence_records.c.run_id == run_id,
-                    evidence_records.c.source == "boundary",
-                    evidence_records.c.event_type
-                    == "boundary.deadline.reached",
-                    evidence_records.c.disposition == "accepted",
+        if reason == "run_budget_expired":
+            if deadline_evidence_id is None:
+                raise EvidenceInvalid("cancellation lacks deadline evidence")
+            deadline = (
+                await connection.execute(
+                    sa.select(evidence_records).where(
+                        evidence_records.c.evidence_id == deadline_evidence_id,
+                        evidence_records.c.run_id == run_id,
+                        evidence_records.c.source == "boundary",
+                        evidence_records.c.event_type
+                        == "boundary.deadline.reached",
+                        evidence_records.c.disposition == "accepted",
+                    )
                 )
+            ).one_or_none()
+            if deadline is None:
+                raise EvidenceInvalid("cancellation lacks deadline evidence")
+            deadline_budget = deadline.payload.get("execution_budget_ms")
+            if deadline_budget != execution_budget_ms:
+                raise EvidenceInvalid("cancellation budget conflicts with deadline")
+        elif deadline_evidence_id is not None:
+            raise EvidenceInvalid(
+                "public cancellation cannot claim deadline evidence"
             )
-        ).one_or_none()
-        if deadline is None:
-            raise EvidenceInvalid("cancellation lacks deadline evidence")
-        deadline_budget = deadline.payload.get("execution_budget_ms")
-        if deadline_budget != execution_budget_ms:
-            raise EvidenceInvalid("cancellation budget conflicts with deadline")
         existing = (
             await connection.execute(
                 sa.select(

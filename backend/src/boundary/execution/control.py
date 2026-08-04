@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID, uuid4
 
 import httpx
@@ -30,12 +30,20 @@ from boundary.evidence.collector import (
     validate_cancelled_collection,
     validate_terminal_collection,
 )
+from boundary.evidence.finalizer import finalize_run_evidence
 from boundary.injection.capability import (
     CONTROL_TOOL_IDENTITY,
     create_control_capability,
     retire_capability,
 )
-from boundary.persistence.tables import runs
+from boundary.persistence.tables import (
+    campaigns,
+    evidence_records,
+    evidence_sets,
+    fault_activations,
+    run_capabilities,
+    runs,
+)
 from boundary.sut.client import (
     InvalidWireResponse,
     SutClient,
@@ -114,6 +122,20 @@ class RunDeadlineReached(Exception):
     """Control flow marker that cannot be mistaken for transport failure."""
 
 
+class CampaignCancellationRequested(Exception):
+    def __init__(self, cancellation_id: UUID) -> None:
+        self.cancellation_id = cancellation_id
+        super().__init__("campaign cancellation was requested")
+
+
+class PreInvocationCancellationRequested(CampaignCancellationRequested):
+    """Cancellation won the durable target-interaction linearization point."""
+
+
+class SimulatedProcessLoss(BaseException):
+    """Test-only crash seam that bypasses ordinary exception settlement."""
+
+
 @dataclass(frozen=True, slots=True)
 class ControlExecutionResult:
     run_id: UUID
@@ -129,6 +151,9 @@ class _CollectionState:
     terminal_status: RunStatus | None = None
     gap_observed: bool = False
     last_high_watermark: int = 0
+
+
+TargetInteractionHook = Callable[[str, Any], Awaitable[None]]
 
 
 class ControlExecutionError(Exception):
@@ -154,6 +179,8 @@ async def execute_control_run(
     http_client: httpx.AsyncClient | None = None,
     clock: ControlClock | None = None,
     sut_client: SutControlPort | None = None,
+    _fail_after: str | None = None,
+    _target_interaction_hook: TargetInteractionHook | None = None,
 ) -> ControlExecutionResult:
     """Invoke, poll, collect, and terminally transition one control run."""
     if not 0 < execution_budget_ms <= 30_000:
@@ -187,6 +214,7 @@ async def execute_control_run(
         tool_identity=CONTROL_TOOL_IDENTITY,
         expires_at=expires_at,
     )
+    _raise_process_loss(_fail_after, "control_capability")
     control_clock = clock or _AsyncioClock()
     budget_started_ns = round(control_clock.monotonic() * 1_000_000_000)
     budget = await record_run_budget(
@@ -199,6 +227,7 @@ async def execute_control_run(
             budget_started_ns + execution_budget_ms * 1_000_000
         ),
     )
+    _raise_process_loss(_fail_after, "control_budget")
     request = TestRunRequest(
         contract_version=CONTRACT_VERSION,
         campaign_id=run.campaign_id,
@@ -236,6 +265,8 @@ async def execute_control_run(
                 capability_record_id=grant.capability_record_id,
                 state=state,
                 budget=budget,
+                _fail_after=_fail_after,
+                _target_interaction_hook=_target_interaction_hook,
             )
         except RunDeadlineReached:
             return await _cancel_after_deadline(
@@ -251,6 +282,30 @@ async def execute_control_run(
                 capability_record_id=grant.capability_record_id,
                 state=state,
                 budget=budget,
+            )
+        except PreInvocationCancellationRequested as cancellation:
+            return await _settle_pre_invocation_cancellation(
+                engine,
+                run=run,
+                capability_record_id=grant.capability_record_id,
+                cancellation_id=cancellation.cancellation_id,
+            )
+        except CampaignCancellationRequested as cancellation:
+            return await _cancel_after_deadline(
+                engine,
+                run=run,
+                client=client,
+                clock=control_clock,
+                run_deadline=control_clock.monotonic(),
+                execution_budget_ms=execution_budget_ms,
+                cancellation_grace_ms=cancellation_grace_ms,
+                poll_interval_ms=poll_interval_ms,
+                http_timeout_seconds=http_timeout_seconds,
+                capability_record_id=grant.capability_record_id,
+                state=state,
+                budget=budget,
+                cancellation_id=cancellation.cancellation_id,
+                deadline_driven=False,
             )
         except SutTransportError:
             if control_clock.monotonic() >= deadline:
@@ -338,7 +393,7 @@ async def _execute_before_deadline(
     engine: AsyncEngine,
     *,
     run,
-    request: TestRunRequest,
+    request: TestRunRequest | None,
     client: SutControlPort,
     clock: ControlClock,
     deadline: float,
@@ -348,22 +403,47 @@ async def _execute_before_deadline(
     state: _CollectionState,
     budget: RunBudgetBinding,
     expected_outcome_kind: str = "success",
+    resume_polling_only: bool = False,
+    _fail_after: str | None = None,
+    _target_interaction_hook: TargetInteractionHook | None = None,
 ) -> ControlExecutionResult:
-    accepted = await _deadline_request(
-        client.create_run,
-        clock=clock,
-        deadline=deadline,
-        configured_timeout=http_timeout_seconds,
-        request=request,
-    )
-    await record_reported_identity(
-        engine,
-        run_id=run.run_id,
-        reported_agent_id=accepted.tested_agent_id,
-        reported_agent_version=accepted.tested_agent_version,
-    )
+    if not resume_polling_only:
+        assert request is not None
+        if _target_interaction_hook is not None:
+            await _target_interaction_hook("before_claim", run)
+        cancellation_id = await _claim_target_interaction(engine, run=run)
+        if cancellation_id is not None:
+            raise PreInvocationCancellationRequested(cancellation_id)
+        if _target_interaction_hook is not None:
+            await _target_interaction_hook("after_claim", run)
+        _raise_process_loss(_fail_after, "target_interaction")
+        accepted = await _deadline_request(
+            client.create_run,
+            clock=clock,
+            deadline=deadline,
+            configured_timeout=http_timeout_seconds,
+            request=request,
+        )
+        await record_reported_identity(
+            engine,
+            run_id=run.run_id,
+            reported_agent_id=accepted.tested_agent_id,
+            reported_agent_version=accepted.tested_agent_version,
+        )
+        async with engine.begin() as connection:
+            await connection.execute(
+                runs.update()
+                .where(runs.c.run_id == run.run_id)
+                .values(execution_checkpoint="polling")
+            )
+        _raise_process_loss(_fail_after, "polling_checkpoint")
 
     while True:
+        cancellation_id = await _campaign_cancellation_id(
+            engine, run.campaign_id
+        )
+        if cancellation_id is not None:
+            raise CampaignCancellationRequested(cancellation_id)
         status = await _deadline_request(
             client.get_status,
             clock=clock,
@@ -432,23 +512,27 @@ async def _cancel_after_deadline(
     capability_record_id: UUID,
     state: _CollectionState,
     budget: RunBudgetBinding,
+    cancellation_id: UUID | None = None,
+    deadline_driven: bool = True,
 ) -> ControlExecutionResult:
     cancellation = CancellationRequest(
         contract_version=CONTRACT_VERSION,
         run_id=run.run_id,
         trace_id=run.trace_id,
-        cancellation_id=uuid4(),
+        cancellation_id=cancellation_id or uuid4(),
     )
     grace_deadline = (
         run_deadline + cancellation_grace_ms / 1000
     )
-    deadline_evidence_id = await record_deadline_reached(
-        engine,
-        run_id=run.run_id,
-        trace_id=run.trace_id,
-        budget=budget,
-        observed_monotonic_ns=round(clock.monotonic() * 1_000_000_000),
-    )
+    deadline_evidence_id = None
+    if deadline_driven:
+        deadline_evidence_id = await record_deadline_reached(
+            engine,
+            run_id=run.run_id,
+            trace_id=run.trace_id,
+            budget=budget,
+            observed_monotonic_ns=round(clock.monotonic() * 1_000_000_000),
+        )
     await record_cancellation_requested(
         engine,
         run_id=run.run_id,
@@ -456,6 +540,11 @@ async def _cancel_after_deadline(
         cancellation_id=cancellation.cancellation_id,
         deadline_evidence_id=deadline_evidence_id,
         execution_budget_ms=execution_budget_ms,
+        reason=(
+            "run_budget_expired"
+            if deadline_driven
+            else "public_campaign_cancellation"
+        ),
     )
     acknowledged = False
     cancellation_applied = False
@@ -819,13 +908,41 @@ async def _load_control_run(engine: AsyncEngine, run_id: UUID):
                 sa.select(runs).where(runs.c.run_id == run_id)
             )
         ).one_or_none()
+        capability_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(run_capabilities)
+            .where(run_capabilities.c.run_id == run_id)
+        )
+        budget_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(evidence_records)
+            .where(
+                evidence_records.c.run_id == run_id,
+                evidence_records.c.source == "boundary",
+                evidence_records.c.disposition == "accepted",
+                evidence_records.c.event_type == "boundary.run_budget.bound",
+            )
+        )
     if run is None:
         raise ValueError("run does not exist")
     if run.run_role != "control" or run.operational_status != "accepted":
         raise ValueError("run is not an accepted control")
     if run.contract_version != CONTRACT_VERSION:
         raise ValueError("run contract version is unsupported")
+    if (
+        run.execution_checkpoint != "not_started"
+        or capability_count
+        or budget_count
+    ):
+        raise ValueError("accepted control is not safely untouched")
     return run
+
+
+def _raise_process_loss(configured: str | None, current: str) -> None:
+    if configured == current:
+        raise SimulatedProcessLoss(
+            f"simulated process loss after {current}"
+        )
 
 
 async def _load_cursor(engine: AsyncEngine, run_id: UUID) -> int:
@@ -838,6 +955,272 @@ async def _load_cursor(engine: AsyncEngine, run_id: UUID) -> int:
     if cursor is None:
         raise ValueError("run does not exist")
     return cursor
+
+
+async def _campaign_cancellation_id(
+    engine: AsyncEngine, campaign_id: UUID
+) -> UUID | None:
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                sa.select(
+                    campaigns.c.cancel_requested,
+                    campaigns.c.cancellation_id,
+                ).where(campaigns.c.campaign_id == campaign_id)
+            )
+        ).one_or_none()
+    if row is None or not row.cancel_requested:
+        return None
+    if row.cancellation_id is None:
+        raise EvidenceInvalid("campaign cancellation identity is missing")
+    return row.cancellation_id
+
+
+async def _claim_target_interaction(
+    engine: AsyncEngine,
+    *,
+    run,
+) -> UUID | None:
+    """Serialize queued cancellation against permission to invoke the target."""
+    async with engine.begin() as connection:
+        campaign = (
+            await connection.execute(
+                sa.select(campaigns)
+                .where(campaigns.c.campaign_id == run.campaign_id)
+                .with_for_update()
+            )
+        ).one_or_none()
+        if campaign is None:
+            raise EvidenceInvalid("run campaign does not exist")
+        if campaign.cancel_requested:
+            if campaign.cancellation_id is None:
+                raise EvidenceInvalid(
+                    "campaign cancellation identity is missing"
+                )
+            return campaign.cancellation_id
+        if campaign.status not in {"accepted", "running"}:
+            raise EvidenceInvalid("run campaign is not executable")
+        checkpointed = await connection.execute(
+            runs.update()
+            .where(
+                runs.c.run_id == run.run_id,
+                runs.c.campaign_id == run.campaign_id,
+                runs.c.operational_status == "accepted",
+                runs.c.execution_checkpoint == "not_started",
+                runs.c.evidence_open.is_(True),
+            )
+            .values(execution_checkpoint="target_interaction")
+        )
+        if checkpointed.rowcount != 1:
+            raise EvidenceInvalid(
+                "target interaction checkpoint is not claimable"
+            )
+    return None
+
+
+async def _settle_pre_invocation_cancellation(
+    engine: AsyncEngine,
+    *,
+    run,
+    capability_record_id: UUID,
+    cancellation_id: UUID,
+) -> ControlExecutionResult:
+    """Finalize cancellation that won before target interaction was claimed."""
+    async with engine.connect() as connection:
+        campaign = (
+            await connection.execute(
+                sa.select(
+                    campaigns.c.cancel_requested,
+                    campaigns.c.cancellation_id,
+                ).where(campaigns.c.campaign_id == run.campaign_id)
+            )
+        ).one_or_none()
+    if (
+        campaign is None
+        or not campaign.cancel_requested
+        or campaign.cancellation_id != cancellation_id
+    ):
+        raise EvidenceInvalid("campaign cancellation binding changed")
+    await retire_capability(engine, capability_record_id)
+    await transition_run(
+        engine,
+        run_id=run.run_id,
+        target_status="cancelled",
+        reason="public_campaign_cancellation_before_invocation",
+    )
+    await finalize_run_evidence(
+        engine,
+        run_id=run.run_id,
+        cutoff_reason="cancellation_grace",
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            runs.update()
+            .where(runs.c.run_id == run.run_id)
+            .values(execution_checkpoint="finalized")
+        )
+        await connection.execute(
+            campaigns.update()
+            .where(
+                campaigns.c.campaign_id == run.campaign_id,
+                campaigns.c.cancel_requested.is_(True),
+            )
+            .values(status="cancelled", current_step="cancelled")
+        )
+    return ControlExecutionResult(
+        run_id=run.run_id,
+        trace_id=run.trace_id,
+        operational_status="cancelled",
+        final_producer_seq=0,
+        target_event_count=0,
+        capability_record_id=capability_record_id,
+    )
+
+
+async def resume_polling_run(
+    engine: AsyncEngine,
+    *,
+    run_id: UUID,
+    sut_base_url: str,
+    execution_budget_ms: int = 30_000,
+    cancellation_grace_ms: int = DEFAULT_CANCELLATION_GRACE_MS,
+    poll_interval_ms: int = 100,
+    http_timeout_seconds: float = 5.0,
+) -> ControlExecutionResult:
+    """Resume only status/event collection; never recreate a target run."""
+    async with engine.connect() as connection:
+        run = (
+            await connection.execute(
+                sa.select(runs).where(runs.c.run_id == run_id)
+            )
+        ).one_or_none()
+        capability = (
+            await connection.execute(
+                sa.select(run_capabilities).where(
+                    run_capabilities.c.run_id == run_id,
+                    run_capabilities.c.state == "active",
+                )
+            )
+        ).one_or_none()
+        budget_row = (
+            await connection.execute(
+                sa.select(evidence_records).where(
+                    evidence_records.c.run_id == run_id,
+                    evidence_records.c.source == "boundary",
+                    evidence_records.c.event_type
+                    == "boundary.run_budget.bound",
+                    evidence_records.c.disposition == "accepted",
+                )
+            )
+        ).one_or_none()
+        unsettled_activations = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(fault_activations)
+            .where(
+                fault_activations.c.run_id == run_id,
+                sa.or_(
+                    fault_activations.c.effect_status.is_distinct_from(
+                        "effect_realized"
+                    ),
+                    fault_activations.c.hold_disposition.is_distinct_from(
+                        "bounded_hold_complete"
+                    ),
+                ),
+            )
+        )
+        finalized = await connection.scalar(
+            sa.select(evidence_sets.c.evidence_set_id).where(
+                evidence_sets.c.run_id == run_id
+            )
+        )
+    if (
+        run is None
+        or run.operational_status not in {"accepted", "running"}
+        or run.execution_checkpoint != "polling"
+        or capability is None
+        or budget_row is None
+        or unsettled_activations
+        or finalized is not None
+        or run.reported_tested_agent_id
+        != run.expected_tested_agent_id
+        or run.reported_tested_agent_version
+        != run.expected_tested_agent_version
+    ):
+        raise ControlExecutionError(
+            "failed", "polling-only checkpoint is not provable"
+        )
+    budget = RunBudgetBinding(
+        evidence_id=budget_row.evidence_id,
+        execution_budget_ms=budget_row.payload["execution_budget_ms"],
+        budget_started_monotonic_ns=budget_row.payload[
+            "budget_started_monotonic_ns"
+        ],
+        deadline_monotonic_ns=budget_row.payload["deadline_monotonic_ns"],
+    )
+    if budget.execution_budget_ms != execution_budget_ms:
+        raise ControlExecutionError("failed", "run budget configuration drifted")
+    clock = _AsyncioClock()
+    deadline = budget.deadline_monotonic_ns / 1_000_000_000
+    client = SutClient(sut_base_url, timeout_seconds=http_timeout_seconds)
+    state = _CollectionState()
+    expected = (
+        "degraded"
+        if run.expected_tested_agent_version == "fixed-v1"
+        and run.run_role == "injected"
+        else "success"
+    )
+    try:
+        if clock.monotonic() >= deadline:
+            raise RunDeadlineReached
+        return await _execute_before_deadline(
+            engine,
+            run=run,
+            request=None,
+            client=client,
+            clock=clock,
+            deadline=deadline,
+            poll_interval_ms=poll_interval_ms,
+            http_timeout_seconds=http_timeout_seconds,
+            capability_record_id=capability.capability_record_id,
+            state=state,
+            budget=budget,
+            expected_outcome_kind=expected,
+            resume_polling_only=True,
+        )
+    except RunDeadlineReached:
+        return await _cancel_after_deadline(
+            engine,
+            run=run,
+            client=client,
+            clock=clock,
+            run_deadline=deadline,
+            execution_budget_ms=execution_budget_ms,
+            cancellation_grace_ms=cancellation_grace_ms,
+            poll_interval_ms=poll_interval_ms,
+            http_timeout_seconds=http_timeout_seconds,
+            capability_record_id=capability.capability_record_id,
+            state=state,
+            budget=budget,
+        )
+    except CampaignCancellationRequested as cancellation:
+        return await _cancel_after_deadline(
+            engine,
+            run=run,
+            client=client,
+            clock=clock,
+            run_deadline=clock.monotonic(),
+            execution_budget_ms=execution_budget_ms,
+            cancellation_grace_ms=cancellation_grace_ms,
+            poll_interval_ms=poll_interval_ms,
+            http_timeout_seconds=http_timeout_seconds,
+            capability_record_id=capability.capability_record_id,
+            state=state,
+            budget=budget,
+            cancellation_id=cancellation.cancellation_id,
+            deadline_driven=False,
+        )
+    finally:
+        await client.aclose()
 
 
 def _remaining_seconds(clock: ControlClock, deadline: float) -> float:

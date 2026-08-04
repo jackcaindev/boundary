@@ -655,9 +655,15 @@ def _boundary_health_check(
     snapshot: FinalizedSnapshot,
     control: FinalizedSnapshot | None,
 ) -> EvaluabilityCheck:
-    refs = snapshot.refs_for_types("boundary.execution.error")
+    refs = snapshot.refs_for_types(
+        "boundary.execution.error",
+        "boundary.reconciliation.execution_error",
+    )
     if control is not None:
-        refs += control.refs_for_types("boundary.execution.error")
+        refs += control.refs_for_types(
+            "boundary.execution.error",
+            "boundary.reconciliation.execution_error",
+        )
     refs = _ordered_unique(refs)
     if refs:
         return _check(

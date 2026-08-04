@@ -148,6 +148,7 @@ class AcceptanceCommand:
     tested_agent_id: str
     tested_agent_version: str
     run_definition: CanonicalDocument
+    executor_managed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +171,7 @@ class PreparedAcceptance:
     run_definition_digest: str
     evidence_payload_bytes: bytes
     evidence_payload_digest: str
+    executor_managed: bool
 
     def __post_init__(self) -> None:
         identity_fields = (
@@ -223,6 +225,7 @@ class PreparedAcceptance:
             "scenario_version": self.scenario_version,
             "tested_agent_id": self.tested_agent_id,
             "tested_agent_version": self.tested_agent_version,
+            "executor_managed": self.executor_managed,
         }
         expected_request_digest = sha256(
             rfc8785.dumps(request_document)
@@ -261,6 +264,7 @@ def prepare_campaign_run_acceptance(
         "scenario_version": command.scenario_version,
         "tested_agent_id": command.tested_agent_id,
         "tested_agent_version": command.tested_agent_version,
+        "executor_managed": command.executor_managed,
     }
     request_digest = sha256(rfc8785.dumps(request_document)).hexdigest()
 
@@ -296,6 +300,7 @@ def prepare_campaign_run_acceptance(
         run_definition_digest=command.run_definition.digest,
         evidence_payload_bytes=evidence_payload_bytes,
         evidence_payload_digest=sha256(evidence_payload_bytes).hexdigest(),
+        executor_managed=command.executor_managed,
     )
 
 
@@ -316,6 +321,12 @@ async def accept_campaign_run(
                     request_digest=prepared.request_digest,
                     campaign_id=prepared.campaign_id,
                     run_id=prepared.run_id,
+                    resource_kind="campaign",
+                    resource_id=prepared.campaign_id,
+                    resource_links={
+                        "campaign_id": str(prepared.campaign_id),
+                        "run_id": str(prepared.run_id),
+                    },
                 )
                 .on_conflict_do_nothing(
                     index_elements=[
@@ -340,6 +351,7 @@ async def accept_campaign_run(
                     status=INITIAL_STATUS,
                     current_step=INITIAL_STEP,
                     cancel_requested=False,
+                    executor_managed=prepared.executor_managed,
                 )
             )
             _raise_for_test_failure(_fail_after, "campaign")
@@ -498,6 +510,10 @@ def _validate_command(command: AcceptanceCommand) -> None:
     if not isinstance(command.run_definition, CanonicalDocument):
         raise InvalidAcceptanceRequest(
             "run_definition must be a CanonicalDocument"
+        )
+    if type(command.executor_managed) is not bool:
+        raise InvalidAcceptanceRequest(
+            "executor_managed must be a boolean"
         )
 
 

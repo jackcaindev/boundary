@@ -116,7 +116,12 @@ class EvidenceManifestV1(ImmutableEvidenceModel):
     fault_spec_digest: Digest | None
     fault_id: UUID | None
     capability_binding: CapabilityBinding | None
-    cutoff_reason: Literal["target_terminal_watermark", "evidence_deadline"]
+    cutoff_reason: Literal[
+        "target_terminal_watermark",
+        "evidence_deadline",
+        "cancellation_grace",
+        "reconciliation_error",
+    ]
     target_producer_cursor: Annotated[StrictInt, Field(ge=0)]
     target_final_watermark: Annotated[StrictInt, Field(ge=0)] | None
     accepted_evidence: list[EvidenceReference]

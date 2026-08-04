@@ -32,7 +32,11 @@ from boundary.evaluation.snapshot import (
     load_finalized_snapshot,
 )
 from boundary.evidence.finalizer import finalize_run_evidence
-from boundary.execution.control import execute_control_run
+from boundary.execution.control import (
+    _raise_process_loss,
+    execute_control_run,
+    resume_polling_run,
+)
 from boundary.execution.injected import (
     FIXED_AGENT_VERSION,
     VULNERABLE_AGENT_VERSION,
@@ -49,6 +53,7 @@ from boundary.persistence.tables import (
     comparisons,
     evidence_records,
     evidence_sets,
+    idempotency_records,
     regression_cases,
     reruns,
     run_capabilities,
@@ -104,6 +109,7 @@ class AcceptedRerun:
     pre_invariance_digest: str
     status: Literal["accepted", "rejected"]
     reason_code: str | None
+    replayed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +205,8 @@ async def create_rerun(
     mode: RerunMode,
     tested_agent_version: str,
     proposed_definition: RerunDefinitionV1 | None = None,
+    idempotency_key: str | None = None,
+    request_digest: str | None = None,
     _fail_after: str | None = None,
 ) -> AcceptedRerun:
     """Create the pre-report and either reject or atomically accept execution."""
@@ -212,6 +220,63 @@ async def create_rerun(
     comparison_id = uuid4() if mode == "version_comparison" else None
     try:
         async with engine.begin() as connection:
+            if (idempotency_key is None) != (request_digest is None):
+                raise ValueError(
+                    "idempotency_key and request_digest must be provided together"
+                )
+            if idempotency_key is not None:
+                existing_mapping = (
+                    await connection.execute(
+                        sa.select(idempotency_records).where(
+                            idempotency_records.c.operation_kind
+                            == "regression.rerun.accept",
+                            idempotency_records.c.idempotency_key
+                            == idempotency_key,
+                        )
+                    )
+                ).one_or_none()
+                if existing_mapping is not None:
+                    if existing_mapping.request_digest != request_digest:
+                        raise RerunConflict("IDEMPOTENCY_CONFLICT")
+                    existing_rerun = (
+                        await connection.execute(
+                            sa.select(reruns).where(
+                                reruns.c.rerun_id
+                                == existing_mapping.resource_id
+                            )
+                        )
+                    ).one_or_none()
+                    if existing_rerun is None:
+                        raise RerunIntegrityError(
+                            "idempotency mapping is missing its rerun"
+                        )
+                    report = _load_pre_report(existing_rerun)
+                    existing_comparison_id = await connection.scalar(
+                        sa.select(comparisons.c.comparison_id).where(
+                            comparisons.c.rerun_id == existing_rerun.rerun_id
+                        )
+                    )
+                    existing_control_trace_id = None
+                    if existing_rerun.control_run_id is not None:
+                        existing_control_trace_id = await connection.scalar(
+                            sa.select(runs.c.trace_id).where(
+                                runs.c.run_id == existing_rerun.control_run_id
+                            )
+                        )
+                    return AcceptedRerun(
+                        rerun_id=existing_rerun.rerun_id,
+                        regression_case_id=existing_rerun.regression_case_id,
+                        mode=existing_rerun.mode,
+                        campaign_id=existing_rerun.campaign_id,
+                        control_run_id=existing_rerun.control_run_id,
+                        control_trace_id=existing_control_trace_id,
+                        comparison_id=existing_comparison_id,
+                        pre_invariance_report=report,
+                        pre_invariance_digest=existing_rerun.pre_invariance_digest,
+                        status=existing_rerun.status,
+                        reason_code=existing_rerun.reason_code,
+                        replayed=True,
+                    )
             _, artifact = await load_regression_case(
                 connection,
                 regression_case_id=regression_case_id,
@@ -266,6 +331,24 @@ async def create_rerun(
                 )
                 if _fail_after == "rejected_rerun":
                     raise RuntimeError("test failure after rejected rerun")
+                if idempotency_key is not None:
+                    await connection.execute(
+                        idempotency_records.insert().values(
+                            operation_kind="regression.rerun.accept",
+                            idempotency_key=idempotency_key,
+                            request_digest=request_digest,
+                            campaign_id=None,
+                            run_id=None,
+                            resource_kind="rerun",
+                            resource_id=rerun_id,
+                            resource_links={
+                                "rerun_id": str(rerun_id),
+                                "campaign_id": None,
+                                "control_run_id": None,
+                                "comparison_id": None,
+                            },
+                        )
+                    )
                 return AcceptedRerun(
                     rerun_id=rerun_id,
                     regression_case_id=regression_case_id,
@@ -303,6 +386,7 @@ async def create_rerun(
                     status="accepted",
                     current_step="control",
                     cancel_requested=False,
+                    executor_managed=idempotency_key is not None,
                 )
             )
             _raise_failure(_fail_after, "campaign")
@@ -404,6 +488,26 @@ async def create_rerun(
                     )
                 )
                 _raise_failure(_fail_after, "comparison")
+            if idempotency_key is not None:
+                await connection.execute(
+                    idempotency_records.insert().values(
+                        operation_kind="regression.rerun.accept",
+                        idempotency_key=idempotency_key,
+                        request_digest=request_digest,
+                        campaign_id=campaign_id,
+                        run_id=control_run_id,
+                        resource_kind="rerun",
+                        resource_id=rerun_id,
+                        resource_links={
+                            "rerun_id": str(rerun_id),
+                            "campaign_id": str(campaign_id),
+                            "control_run_id": str(control_run_id),
+                            "comparison_id": (
+                                str(comparison_id) if comparison_id else None
+                            ),
+                        },
+                    )
+                )
     except (
         MaterializationIneligible,
         RegressionIntegrityError,
@@ -412,6 +516,20 @@ async def create_rerun(
     ):
         raise
     except IntegrityError as error:
+        if (
+            idempotency_key is not None
+            and _constraint_name(error) == "pk_idempotency_records"
+        ):
+            return await create_rerun(
+                engine,
+                regression_case_id=regression_case_id,
+                mode=mode,
+                tested_agent_version=tested_agent_version,
+                proposed_definition=proposed_definition,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                _fail_after=_fail_after,
+            )
         if _constraint_name(error) in {
             "pk_reruns",
             "uq_reruns_campaign_id",
@@ -440,6 +558,7 @@ async def create_rerun(
         pre_invariance_digest=report_digest,
         status="accepted",
         reason_code=None,
+        replayed=False,
     )
 
 
@@ -528,7 +647,10 @@ async def execute_rerun(
     sut_base_url: str,
     boundary_internal_base_url: str,
     execution_budget_ms: int = 30_000,
-) -> CompletedRerun:
+    _fail_after: str | None = None,
+    _sut_client=None,
+    _target_interaction_hook=None,
+) -> CompletedRerun | None:
     """Run fresh control and injected evidence through the existing real path."""
     async with engine.begin() as connection:
         rerun = (
@@ -542,13 +664,14 @@ async def execute_rerun(
             raise RerunError("rerun does not exist")
         if rerun.status == "rejected":
             raise RerunRejected(rerun_id, rerun.reason_code)
-        if rerun.status != "accepted":
-            raise RerunError("rerun is not accepted for execution")
-        await connection.execute(
-            reruns.update()
-            .where(reruns.c.rerun_id == rerun_id)
-            .values(status="running")
-        )
+        if rerun.status not in {"accepted", "running", "completed"}:
+            raise RerunError("rerun is not resumable for execution")
+        if rerun.status == "accepted":
+            await connection.execute(
+                reruns.update()
+                .where(reruns.c.rerun_id == rerun_id)
+                .values(status="running")
+            )
         await connection.execute(
             campaigns.update()
             .where(campaigns.c.campaign_id == rerun.campaign_id)
@@ -560,47 +683,137 @@ async def execute_rerun(
         )
     try:
         assert rerun.control_run_id is not None
-        await execute_control_run(
-            engine,
-            run_id=rerun.control_run_id,
-            sut_base_url=sut_base_url,
-            tool_endpoint=(
-                f"{boundary_internal_base_url}/internal/v1/runs/"
-                f"{rerun.control_run_id}/tools/phase1-lookup"
-            ),
-            tested_input=artifact.tested_input.query,
-            execution_budget_ms=execution_budget_ms,
-        )
+        control_result = None
+        async with engine.connect() as connection:
+            control_run = await _run_row(connection, rerun.control_run_id)
+        if (
+            control_run.operational_status in {"accepted", "running"}
+            and control_run.execution_checkpoint == "polling"
+        ):
+            control_result = await resume_polling_run(
+                engine,
+                run_id=rerun.control_run_id,
+                sut_base_url=sut_base_url,
+                execution_budget_ms=execution_budget_ms,
+            )
+        elif control_run.operational_status == "accepted":
+            control_result = await execute_control_run(
+                engine,
+                run_id=rerun.control_run_id,
+                sut_base_url=sut_base_url,
+                tool_endpoint=(
+                    f"{boundary_internal_base_url}/internal/v1/runs/"
+                    f"{rerun.control_run_id}/tools/phase1-lookup"
+                ),
+                tested_input=artifact.tested_input.query,
+                execution_budget_ms=execution_budget_ms,
+                sut_client=_sut_client,
+                _fail_after=_fail_after,
+                _target_interaction_hook=_target_interaction_hook,
+            )
+        if (
+            control_result is not None
+            and control_result.operational_status
+            in {"cancelled", "timed_out"}
+            and await _campaign_cancel_requested(engine, rerun.campaign_id)
+        ):
+            await _finalize_cancelled_execution(
+                engine,
+                run_id=rerun.control_run_id,
+            )
+            await _mark_rerun_cancelled(engine, rerun_id=rerun_id)
+            return None
         control_set = await finalize_run_evidence(
             engine,
             run_id=rerun.control_run_id,
         )
+        if await _campaign_cancel_requested(engine, rerun.campaign_id):
+            await _mark_rerun_cancelled(engine, rerun_id=rerun_id)
+            return None
         async with engine.begin() as connection:
             await connection.execute(
                 campaigns.update()
                 .where(campaigns.c.campaign_id == rerun.campaign_id)
                 .values(current_step="injected")
             )
-        sibling = await create_injected_sibling(
-            engine,
-            control_run_id=rerun.control_run_id,
-            expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
-            rerun_id=rerun_id,
-        )
-        await execute_injected_run(
-            engine,
-            sibling=sibling,
-            sut_base_url=sut_base_url,
-            tool_endpoint=(
-                f"{boundary_internal_base_url}/internal/v1/runs/"
-                f"{sibling.run_id}/tools/phase1-lookup"
-            ),
-            execution_budget_ms=execution_budget_ms,
-        )
+        async with engine.connect() as connection:
+            current_rerun = (
+                await connection.execute(
+                    sa.select(reruns).where(reruns.c.rerun_id == rerun_id)
+                )
+            ).one()
+            candidate_run = (
+                await _run_row(connection, current_rerun.candidate_run_id)
+                if current_rerun.candidate_run_id is not None
+                else None
+            )
+        if candidate_run is None:
+            sibling = await create_injected_sibling(
+                engine,
+                control_run_id=rerun.control_run_id,
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+                rerun_id=rerun_id,
+            )
+            _raise_process_loss(_fail_after, "rerun_candidate_sibling")
+            candidate_result = await execute_injected_run(
+                engine,
+                sibling=sibling,
+                sut_base_url=sut_base_url,
+                tool_endpoint=(
+                    f"{boundary_internal_base_url}/internal/v1/runs/"
+                    f"{sibling.run_id}/tools/phase1-lookup"
+                ),
+                execution_budget_ms=execution_budget_ms,
+                sut_client=_sut_client,
+                _fail_after=_fail_after,
+                _target_interaction_hook=_target_interaction_hook,
+            )
+            candidate_run_id = sibling.run_id
+        elif (
+            candidate_run.operational_status in {"accepted", "running"}
+            and candidate_run.execution_checkpoint == "polling"
+        ):
+            candidate_result = await resume_polling_run(
+                engine,
+                run_id=candidate_run.run_id,
+                sut_base_url=sut_base_url,
+                execution_budget_ms=execution_budget_ms,
+            )
+            candidate_run_id = candidate_run.run_id
+        elif candidate_run.operational_status == "accepted":
+            raise RerunError(
+                "accepted rerun candidate lacks live capability authority"
+            )
+        else:
+            candidate_result = None
+            candidate_run_id = candidate_run.run_id
+        if (
+            candidate_result is not None
+            and candidate_result.operational_status
+            in {"cancelled", "timed_out"}
+            and await _campaign_cancel_requested(engine, rerun.campaign_id)
+        ):
+            candidate_set = await _finalize_cancelled_execution(
+                engine,
+                run_id=candidate_run_id,
+            )
+            await analyze_evidence_set(
+                engine,
+                evidence_set_id=candidate_set.evidence_set_id,
+            )
+            await _mark_rerun_cancelled(engine, rerun_id=rerun_id)
+            return None
         candidate_set = await finalize_run_evidence(
             engine,
-            run_id=sibling.run_id,
+            run_id=candidate_run_id,
         )
+        if await _campaign_cancel_requested(engine, rerun.campaign_id):
+            await analyze_evidence_set(
+                engine,
+                evidence_set_id=candidate_set.evidence_set_id,
+            )
+            await _mark_rerun_cancelled(engine, rerun_id=rerun_id)
+            return None
         candidate_analysis = await analyze_evidence_set(
             engine,
             evidence_set_id=candidate_set.evidence_set_id,
@@ -629,7 +842,7 @@ async def execute_rerun(
         return CompletedRerun(
             rerun_id=rerun_id,
             control_run_id=rerun.control_run_id,
-            candidate_run_id=sibling.run_id,
+            candidate_run_id=candidate_run_id,
             candidate_evidence_set_id=candidate_set.evidence_set_id,
             candidate_analysis_id=candidate_analysis.analysis_id,
             completed_invariance_report=report,
@@ -1311,6 +1524,10 @@ def _comparison_ineligibility_reason(
         or candidate_run.expected_tested_agent_version != FIXED_AGENT_VERSION
         or candidate_run.reported_tested_agent_version
         != candidate_run.expected_tested_agent_version
+        or comparison.candidate_tested_agent_version
+        != candidate_run.expected_tested_agent_version
+        or comparison.candidate_tested_agent_version
+        != rerun.requested_tested_agent_version
     ):
         return "CANDIDATE_VERSION_NOT_FIXED_DIFFERENCE"
     if rerun.regression_case_id != artifact.regression_case_id:
@@ -1389,6 +1606,164 @@ async def _seal_comparison_row(
         reason_code=reason_code,
         summary_digest=digest,
         replayed=False,
+    )
+
+
+async def _campaign_cancel_requested(engine, campaign_id) -> bool:
+    async with engine.connect() as connection:
+        return bool(
+            await connection.scalar(
+                sa.select(campaigns.c.cancel_requested).where(
+                    campaigns.c.campaign_id == campaign_id
+                )
+            )
+        )
+
+
+async def _finalize_cancelled_execution(engine, *, run_id):
+    async with engine.connect() as connection:
+        run = (
+            await connection.execute(
+                sa.select(runs).where(runs.c.run_id == run_id)
+            )
+        ).one()
+        existing_cutoff = await connection.scalar(
+            sa.select(evidence_sets.c.cutoff_reason).where(
+                evidence_sets.c.run_id == run_id
+            )
+        )
+    cutoff = existing_cutoff or (
+        "target_terminal_watermark"
+        if run.operational_status == "cancelled"
+        and run.target_final_watermark is not None
+        and run.target_producer_cursor == run.target_final_watermark
+        else "cancellation_grace"
+    )
+    return await finalize_run_evidence(
+        engine,
+        run_id=run_id,
+        cutoff_reason=cutoff,
+    )
+
+
+async def _mark_rerun_cancelled(engine, *, rerun_id):
+    async with engine.begin() as connection:
+        rerun = (
+            await connection.execute(
+                sa.select(reruns)
+                .where(reruns.c.rerun_id == rerun_id)
+                .with_for_update()
+            )
+        ).one()
+        campaign = (
+            await connection.execute(
+                sa.select(campaigns)
+                .where(campaigns.c.campaign_id == rerun.campaign_id)
+                .with_for_update()
+            )
+        ).one()
+        if not campaign.cancel_requested:
+            raise RerunConflict("campaign cancellation was not requested")
+        if rerun.status == "completed":
+            return
+        if rerun.status == "failed" and rerun.reason_code != "CAMPAIGN_CANCELLED":
+            return
+        await connection.execute(
+            reruns.update()
+            .where(
+                reruns.c.rerun_id == rerun_id,
+                reruns.c.status.in_(["accepted", "running"]),
+            )
+            .values(status="failed", reason_code="CAMPAIGN_CANCELLED")
+        )
+        if rerun.mode == "version_comparison":
+            await _seal_cancelled_comparison(
+                connection,
+                rerun=rerun,
+            )
+        await connection.execute(
+            campaigns.update()
+            .where(
+                campaigns.c.campaign_id == rerun.campaign_id,
+                campaigns.c.cancel_requested.is_(True),
+            )
+            .values(status="cancelled", current_step="cancelled")
+        )
+
+
+async def settle_rerun_cancellation(engine, *, rerun_id):
+    """Replay-safe terminal settlement for a cancelled rerun campaign."""
+    await _mark_rerun_cancelled(engine, rerun_id=rerun_id)
+
+
+async def _seal_cancelled_comparison(connection, *, rerun):
+    comparison = (
+        await connection.execute(
+            sa.select(comparisons)
+            .where(comparisons.c.rerun_id == rerun.rerun_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if comparison is None:
+        raise RerunIntegrityError("version-comparison rerun is missing comparison")
+    _, artifact = await load_regression_case(
+        connection,
+        regression_case_id=rerun.regression_case_id,
+        lock=True,
+    )
+    candidate_evidence_set_id = None
+    candidate_analysis_id = None
+    candidate_policy_result = None
+    if rerun.candidate_run_id is not None:
+        candidate_evidence_set_id = await connection.scalar(
+            sa.select(evidence_sets.c.evidence_set_id).where(
+                evidence_sets.c.run_id == rerun.candidate_run_id
+            )
+        )
+        if candidate_evidence_set_id is not None:
+            candidate = (
+                await connection.execute(
+                    sa.select(analyses)
+                    .where(
+                        analyses.c.evidence_set_id == candidate_evidence_set_id,
+                        analyses.c.record_kind == "authoritative",
+                    )
+                    .order_by(analyses.c.created_at.desc())
+                )
+            ).first()
+            if candidate is not None:
+                candidate_analysis_id = candidate.analysis_id
+                candidate_policy_result = candidate.policy_result
+    failure = ComparisonFailureSummaryV1(
+        summary_schema_version=1,
+        comparison_id=comparison.comparison_id,
+        regression_case_id=artifact.regression_case_id,
+        rerun_id=rerun.rerun_id,
+        source_run_id=artifact.source_run_id,
+        source_evidence_set_id=artifact.source_evidence_set_id,
+        source_analysis_id=artifact.source_analysis_id,
+        candidate_run_id=rerun.candidate_run_id,
+        candidate_evidence_set_id=candidate_evidence_set_id,
+        candidate_analysis_id=candidate_analysis_id,
+        source_tested_agent_version=artifact.original_tested_agent_version,
+        candidate_tested_agent_version=rerun.requested_tested_agent_version,
+        source_policy_result="FAIL",
+        candidate_policy_result=candidate_policy_result,
+        completed_invariance_digest=rerun.completed_invariance_digest,
+        terminal_result="INELIGIBLE",
+        reason_code="CAMPAIGN_CANCELLED",
+    )
+    await _seal_comparison_row(
+        connection,
+        comparison=comparison,
+        summary=failure,
+        status="ineligible",
+        terminal_result="INELIGIBLE",
+        reason_code="CAMPAIGN_CANCELLED",
+        candidate_run_id=rerun.candidate_run_id,
+        candidate_evidence_set_id=candidate_evidence_set_id,
+        candidate_analysis_id=candidate_analysis_id,
+        candidate_policy_result=candidate_policy_result,
     )
 
 

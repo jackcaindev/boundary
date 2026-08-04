@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from boundary.domain.definitions import Phase1FaultDefinition
 from boundary.evidence.canonical import canonicalize_fault_definition, fault_definition_digest
+from boundary.config import BoundarySettings
+from boundary.executor import SerialExecutor
 from boundary.execution.injected import (
     bind_control_tested_input,
     create_injected_sibling,
@@ -38,7 +40,15 @@ from boundary.injection.tool_stub import (
     ToolRegistrationPersistenceError,
     register_tool_call,
 )
-from boundary.persistence.tables import evidence_records, fault_activations, runs, tool_calls
+from boundary.persistence.tables import (
+    analyses,
+    campaigns,
+    evidence_records,
+    evidence_sets,
+    fault_activations,
+    runs,
+    tool_calls,
+)
 from boundary.persistence.transactions import (
     AcceptanceCommand,
     CanonicalDocument,
@@ -352,6 +362,80 @@ async def test_process_loss_after_effect_preserves_effect_but_marks_hold_lost(
     assert row.effect_status == "effect_realized"
     assert row.effect_evidence_id == effect_id
     assert row.hold_disposition == "runtime_lost"
+
+
+async def test_executor_reconciliation_finalizes_lost_activation_as_execution_error(
+    database_engine: AsyncEngine,
+) -> None:
+    control, sibling = await _sibling(database_engine)
+    _, _, result = await _activate(database_engine, sibling)
+    async with database_engine.begin() as connection:
+        await connection.execute(
+            campaigns.update()
+            .where(campaigns.c.campaign_id == control.campaign_id)
+            .values(status="running")
+        )
+        await connection.execute(
+            runs.update()
+            .where(runs.c.run_id == sibling.run_id)
+            .values(
+                operational_status="running",
+                execution_checkpoint="polling",
+                reported_tested_agent_id="boundary.sample-agent",
+                reported_tested_agent_version="vulnerable-v1",
+            )
+        )
+
+    executor = SerialExecutor(
+        database_engine,
+        BoundarySettings(
+            sut_base_url="http://sample-agent:8001",
+            boundary_internal_base_url="http://boundary:8000",
+        ),
+        _include_unmanaged=True,
+    )
+    await executor.reconcile_startup()
+
+    async with database_engine.connect() as connection:
+        activation = (
+            await connection.execute(
+                sa.select(fault_activations).where(
+                    fault_activations.c.activation_evidence_id
+                    == result.activation_evidence_id
+                )
+            )
+        ).one()
+        effect_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(evidence_records)
+            .where(
+                evidence_records.c.run_id == sibling.run_id,
+                evidence_records.c.event_type
+                == "boundary.fault_effect_realized",
+            )
+        )
+        evidence_set = (
+            await connection.execute(
+                sa.select(evidence_sets).where(
+                    evidence_sets.c.run_id == sibling.run_id
+                )
+            )
+        ).one()
+        analysis = (
+            await connection.execute(
+                sa.select(analyses).where(
+                    analyses.c.evidence_set_id
+                    == evidence_set.evidence_set_id,
+                    analyses.c.record_kind == "authoritative",
+                )
+            )
+        ).one()
+    assert activation.effect_status == "runtime_lost"
+    assert activation.effect_evidence_id is None
+    assert activation.hold_disposition == "runtime_lost"
+    assert effect_count == 0
+    assert evidence_set.cutoff_reason == "reconciliation_error"
+    assert analysis.evaluability_aggregate == "EXECUTION_ERROR"
 
 
 async def test_two_effect_chains_and_ordinal_two_normal_response(

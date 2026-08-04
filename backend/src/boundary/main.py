@@ -7,10 +7,16 @@ from contextlib import asynccontextmanager
 from uuid import UUID
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from boundary.api.errors import PublicProblem, problem_response
+from boundary.api.routes import router as public_router
+from boundary.config import BoundarySettings, ConfigurationError
+from boundary.executor import SerialExecutor
 
 from boundary.injection.contract_v1 import (
     CONTRACT_VERSION,
@@ -34,21 +40,65 @@ from boundary.persistence.database import (
 )
 
 
-def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
+def create_app(
+    *,
+    engine: AsyncEngine | None = None,
+    settings: BoundarySettings | None = None,
+    executor_enabled: bool = True,
+) -> FastAPI:
     owns_engine = engine is None
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        if application.state.database_engine is None:
-            application.state.database_engine = create_database_engine(
-                DatabaseSettings.from_environment()
-            )
+        executor = None
         try:
+            try:
+                selected_settings = (
+                    settings or BoundarySettings.from_environment()
+                )
+                application.state.settings = selected_settings
+                if application.state.database_engine is None:
+                    application.state.database_engine = create_database_engine(
+                        DatabaseSettings.from_environment()
+                    )
+                async with application.state.database_engine.connect() as connection:
+                    await connection.execute(text("SELECT 1"))
+                    revision = await connection.scalar(
+                        text("SELECT version_num FROM alembic_version")
+                    )
+                if revision != "0007_executor_public_api":
+                    raise ConfigurationError(
+                        "database migration is not at Task 8 head"
+                    )
+                if executor_enabled:
+                    executor = SerialExecutor(
+                        application.state.database_engine, selected_settings
+                    )
+                    application.state.executor = executor
+                    await executor.start()
+                    if not executor.running:
+                        raise ConfigurationError("executor loop did not start")
+                application.state.reconciliation_complete = True
+                application.state.ready = True
+            except Exception:
+                application.state.startup_error = "STARTUP_NOT_READY"
             yield
         finally:
+            application.state.ready = False
+            if executor is not None:
+                shutdown_timeout = 8.0
+                if application.state.settings is not None:
+                    shutdown_timeout = (
+                        application.state.settings.cancellation_grace_ms
+                        / 1000
+                        + 6.0
+                    )
+                await executor.stop(timeout_seconds=shutdown_timeout)
             await application.state.activation_registry.wait_all()
             if owns_engine:
-                await application.state.database_engine.dispose()
+                database_engine = application.state.database_engine
+                if database_engine is not None:
+                    await database_engine.dispose()
 
     application = FastAPI(
         title="Boundary internal service",
@@ -57,15 +107,69 @@ def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
     )
     application.state.database_engine = engine
     application.state.activation_registry = ActivationRuntimeRegistry()
+    application.state.executor = None
+    application.state.settings = settings
+    application.state.ready = False
+    application.state.reconciliation_complete = False
+    application.state.startup_error = None
+
+    @application.exception_handler(PublicProblem)
+    async def public_problem_handler(
+        request: Request, error: PublicProblem
+    ) -> JSONResponse:
+        del request
+        return problem_response(error.status, error.code, error.detail)
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_problem_handler(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        del request, error
+        return problem_response(
+            422,
+            "INVALID_REQUEST",
+            "request structure or fields are invalid",
+        )
+
+    @application.exception_handler(Exception)
+    async def unexpected_problem_handler(
+        request: Request, error: Exception
+    ) -> JSONResponse:
+        del request, error
+        return problem_response(
+            500,
+            "BOUNDARY_INTERNAL_ERROR",
+            "Boundary could not complete the request",
+        )
 
     @application.get("/health")
     async def health() -> dict[str, str]:
+        return {"status": "live"}
+
+    @application.get("/health/live")
+    async def liveness() -> dict[str, str]:
+        return {"status": "live"}
+
+    @application.get("/health/ready")
+    async def readiness() -> JSONResponse:
         database_engine = application.state.database_engine
-        if database_engine is None:
-            return {"status": "starting"}
-        async with database_engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
-        return {"status": "ok"}
+        executor = application.state.executor
+        ready = (
+            application.state.ready
+            and application.state.reconciliation_complete
+            and database_engine is not None
+            and (not executor_enabled or (executor is not None and executor.running))
+        )
+        if ready:
+            try:
+                async with database_engine.connect() as connection:
+                    await connection.execute(text("SELECT 1"))
+            except Exception:
+                ready = False
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready"},
+        )
 
     @application.post(
         "/internal/v1/runs/{route_run_id}/tools/phase1-lookup"
@@ -173,6 +277,7 @@ def create_app(*, engine: AsyncEngine | None = None) -> FastAPI:
             content=registered.response.model_dump(mode="json")
         )
 
+    application.include_router(public_router)
     return application
 
 

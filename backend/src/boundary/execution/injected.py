@@ -361,21 +361,28 @@ async def execute_injected_run(
     sut_base_url: str,
     tool_endpoint: str,
     execution_budget_ms: int = 30_000,
+    cancellation_grace_ms: int = 2_000,
     poll_interval_ms: int = 100,
     http_timeout_seconds: float = 5.0,
     http_client: httpx.AsyncClient | None = None,
     clock=None,
     sut_client=None,
+    _fail_after: str | None = None,
+    _target_interaction_hook=None,
 ):
     """Invoke a prepared injected sibling and wait for every hold to settle."""
     from boundary.execution.control import (
         DEFAULT_CANCELLATION_GRACE_MS,
         ControlExecutionError,
+        CampaignCancellationRequested,
+        PreInvocationCancellationRequested,
         RunDeadlineReached,
         _AsyncioClock,
         _CollectionState,
         _cancel_after_deadline,
         _execute_before_deadline,
+        _raise_process_loss,
+        _settle_pre_invocation_cancellation,
         _terminal_failure,
     )
 
@@ -385,6 +392,23 @@ async def execute_injected_run(
                 sa.select(runs).where(runs.c.run_id == sibling.run_id)
             )
         ).one_or_none()
+        capability = (
+            await connection.execute(
+                sa.select(run_capabilities).where(
+                    run_capabilities.c.run_id == sibling.run_id
+                )
+            )
+        ).one_or_none()
+        budget_count = await connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(evidence_records)
+            .where(
+                evidence_records.c.run_id == sibling.run_id,
+                evidence_records.c.source == "boundary",
+                evidence_records.c.disposition == "accepted",
+                evidence_records.c.event_type == "boundary.run_budget.bound",
+            )
+        )
     if run is None or run.run_role != "injected" or run.operational_status != "accepted":
         raise InjectedExecutionError("run is not an accepted injected sibling")
     if (
@@ -394,6 +418,17 @@ async def execute_injected_run(
         or run.fault_id != sibling.fault_id
     ):
         raise InjectedExecutionError("injected sibling identity is inconsistent")
+    if (
+        run.execution_checkpoint != "not_started"
+        or capability is None
+        or capability.capability_record_id
+        != sibling.capability.capability_record_id
+        or capability.state != "active"
+        or budget_count
+    ):
+        raise InjectedExecutionError(
+            "accepted injected sibling lacks live preparation authority"
+        )
     try:
         validate_phase1_fault_document(
             run.run_definition,
@@ -433,6 +468,7 @@ async def execute_injected_run(
             budget_started_ns + execution_budget_ms * 1_000_000
         ),
     )
+    _raise_process_loss(_fail_after, "injected_budget")
     deadline = budget.deadline_monotonic_ns / 1_000_000_000
     if run.expected_tested_agent_version not in {
         VULNERABLE_AGENT_VERSION,
@@ -467,6 +503,8 @@ async def execute_injected_run(
                 state=state,
                 expected_outcome_kind=expected_outcome,
                 budget=budget,
+                _fail_after=_fail_after,
+                _target_interaction_hook=_target_interaction_hook,
             )
         except RunDeadlineReached:
             result = await _cancel_after_deadline(
@@ -476,17 +514,46 @@ async def execute_injected_run(
                 clock=selected_clock,
                 run_deadline=deadline,
                 execution_budget_ms=execution_budget_ms,
-                cancellation_grace_ms=DEFAULT_CANCELLATION_GRACE_MS,
+                cancellation_grace_ms=cancellation_grace_ms,
                 poll_interval_ms=poll_interval_ms,
                 http_timeout_seconds=http_timeout_seconds,
                 capability_record_id=sibling.capability.capability_record_id,
                 state=state,
                 budget=budget,
             )
+        except PreInvocationCancellationRequested as cancellation:
+            result = await _settle_pre_invocation_cancellation(
+                engine,
+                run=run,
+                capability_record_id=(
+                    sibling.capability.capability_record_id
+                ),
+                cancellation_id=cancellation.cancellation_id,
+            )
+        except CampaignCancellationRequested as cancellation:
+            result = await _cancel_after_deadline(
+                engine,
+                run=run,
+                client=client,
+                clock=selected_clock,
+                run_deadline=selected_clock.monotonic(),
+                execution_budget_ms=execution_budget_ms,
+                cancellation_grace_ms=cancellation_grace_ms,
+                poll_interval_ms=poll_interval_ms,
+                http_timeout_seconds=http_timeout_seconds,
+                capability_record_id=sibling.capability.capability_record_id,
+                state=state,
+                budget=budget,
+                cancellation_id=cancellation.cancellation_id,
+                deadline_driven=False,
+            )
         await _wait_for_activation_settlement(
             engine,
             run_id=run.run_id,
             clock=selected_clock,
+            require_complete_set=(
+                result.operational_status not in {"cancelled", "timed_out"}
+            ),
         )
         return result
     except ControlExecutionError as error:
@@ -560,6 +627,7 @@ async def _wait_for_activation_settlement(
     *,
     run_id: UUID,
     clock,
+    require_complete_set: bool = True,
 ) -> None:
     deadline = clock.monotonic() + 2.5
     while True:
@@ -571,11 +639,12 @@ async def _wait_for_activation_settlement(
                     .order_by(fault_activations.c.activation_ordinal)
                 )
             ).all()
-        if len(rows) == 2 and all(
+        settled = all(
             row.effect_status in {"effect_realized", "unproven", "runtime_lost"}
             and row.hold_disposition is not None
             for row in rows
-        ):
+        )
+        if settled and (len(rows) == 2 or not require_complete_set):
             if any(
                 row.effect_status != "effect_realized"
                 or row.hold_disposition != "bounded_hold_complete"

@@ -186,6 +186,7 @@ This limited safe-resume rule must be tested; implementation may conservatively 
 Cancellation is a durable, idempotent campaign command:
 
 - the API records `cancel_requested` and a Boundary cancellation identity;
+- immediately before target creation, the executor locks the authoritative campaign and atomically either observes `cancel_requested` or advances the run from `not_started` to the durable `target_interaction` checkpoint. This transaction is the cancellation/invocation linearization point. If cancellation wins, Boundary settles the prepared run without any target I/O. If execution wins, the transaction commits before the later network write and active-run cancellation semantics apply; no PostgreSQL transaction spans that write;
 - the executor prevents unstarted sibling runs from starting;
 - for an active target run it records Boundary cancellation evidence, invokes ADR 001 cancellation, retires the tool capability, and collects through the 2,000 ms grace period;
 - a sealed target cancellation becomes operational `cancelled`; no seal in time becomes `timed_out`;

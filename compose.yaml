@@ -28,6 +28,17 @@ services:
     environment:
       DATABASE_URL: >-
         postgresql+asyncpg://boundary:boundary-local-only@postgres:5432/boundary
+      SUT_BASE_URL: http://sample-agent:8001
+      BOUNDARY_INTERNAL_BASE_URL: http://boundary:8000
+      RUN_DEADLINE_MS: "30000"
+      CANCELLATION_GRACE_MS: "2000"
+      TARGET_POLL_INTERVAL_MS: "100"
+      TOOL_CLIENT_TIMEOUT_MS: "500"
+      INJECTED_HOLD_MS: "1000"
+      MAX_EVENT_BYTES: "65536"
+      MAX_TARGET_EVENTS: "256"
+      MAX_TARGET_EVENT_BYTES: "1048576"
+      LOG_LEVEL: INFO
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,7 +70,7 @@ services:
         - -c
         - >-
           import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)
       interval: 2s
       timeout: 3s
       retries: 30

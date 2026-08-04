@@ -338,6 +338,16 @@ def _injected_snapshot(
                 },
                 caused_by=activation.evidence_id,
             )
+        if mutation == "reconciliation_failure" and ordinal_value == 0:
+            builder.add(
+                "reconciliation-error-0",
+                "boundary.reconciliation.execution_error",
+                {
+                    "reason_code": "RUNTIME_LOST_UNPROVEN",
+                    "run_id": str(run_id),
+                    "schema_version": 1,
+                },
+            )
         timeout_activations.append(
             FinalizedTimeoutActivation(
                 activation_id=(
@@ -655,6 +665,23 @@ def test_recorded_boundary_timeout_failure_is_execution_error() -> None:
         ),
         _control_snapshot(),
     )
+    assert analysis.evaluability.aggregate == "EXECUTION_ERROR"
+    assert analysis.assertions is None
+
+
+def test_recorded_reconciliation_failure_is_execution_error() -> None:
+    analysis = build_analysis_document(
+        _injected_snapshot(mutation="reconciliation_failure"),
+        _control_snapshot(),
+    )
+    health = next(
+        check
+        for check in analysis.evaluability.checks
+        if check.check_id == "EVAL.BOUNDARY_SYSTEMS_HEALTHY"
+    )
+    assert health.outcome == "EXECUTION_ERROR"
+    assert health.reason_code == "BOUNDARY_COMPONENT_FAILURE"
+    assert len(health.evidence_references) == 1
     assert analysis.evaluability.aggregate == "EXECUTION_ERROR"
     assert analysis.assertions is None
 

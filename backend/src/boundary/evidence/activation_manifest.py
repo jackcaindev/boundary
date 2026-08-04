@@ -25,6 +25,7 @@ async def build_timeout_activation_bindings(
     *,
     run_id,
     evidence_by_id: dict,
+    allow_unstarted_reservations: bool = False,
 ) -> list[FinalizedTimeoutActivation]:
     """Copy every settled authoritative activation fact into the manifest."""
     rows = (
@@ -42,6 +43,13 @@ async def build_timeout_activation_bindings(
     calls_by_id = {row.tool_call_id: row for row in calls}
     bindings: list[FinalizedTimeoutActivation] = []
     for row in rows:
+        if (
+            allow_unstarted_reservations
+            and row.reservation_state == "pre_effect_reserved"
+            and row.effect_status == "not_started"
+            and row.activation_evidence_id is None
+        ):
+            continue
         call = calls_by_id.get(row.tool_call_id)
         activation_evidence = evidence_by_id.get(row.activation_evidence_id)
         effect_evidence = evidence_by_id.get(row.effect_evidence_id)
