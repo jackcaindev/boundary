@@ -214,6 +214,9 @@ async def read_run(engine: AsyncEngine, run_id: UUID) -> RunView:
         fault_definition_digest=run.run_definition_digest if run.fault_id else None,
         evidence_set_id=snapshot.manifest.evidence_set_id if snapshot else None,
         evidence_set_digest=snapshot.evidence_set_digest if snapshot else None,
+        finalizer_identity=(
+            snapshot.manifest.finalizer_identity if snapshot else None
+        ),
         analysis_id=analysis_row.analysis_id if analysis_row else None,
         analysis_digest=analysis_row.analysis_digest if analysis_row else None,
         analyzer_version=analysis.analyzer_version if analysis else None,

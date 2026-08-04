@@ -10,7 +10,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from boundary.persistence.tables import campaigns, comparisons
+from boundary.persistence.tables import campaigns, comparisons, evidence_sets
 
 
 pytestmark = [
@@ -112,6 +112,9 @@ async def test_public_api_executes_fail_case_fixed_pass_and_verifies_reads(
         ).json()
         assert injected["operational_status"] in {"completed", "timed_out"}
         assert injected["policy_result"] == "FAIL"
+        assert injected["finalizer_identity"] == (
+            "boundary.phase1.evidence-finalizer/v1"
+        )
         assert injected["evaluability"]["aggregate"] == "EVALUABLE"
         assert {
             item["assertion_id"]: item["outcome"]
@@ -228,6 +231,48 @@ async def test_public_api_executes_fail_case_fixed_pass_and_verifies_reads(
         assert tampered.json()["code"] == "COMPARISON_INTEGRITY_FAILED"
         assert "traceback" not in tampered.text.lower()
 
+        evidence_set_id = UUID(injected["evidence_set_id"])
+        unverified_identity = "unverified.evidence-finalizer/v999"
+        async with database_engine.begin() as connection:
+            evidence_set = (
+                await connection.execute(
+                    sa.select(evidence_sets).where(
+                        evidence_sets.c.evidence_set_id == evidence_set_id
+                    )
+                )
+            ).one()
+            await connection.execute(
+                evidence_sets.update()
+                .where(evidence_sets.c.evidence_set_id == evidence_set_id)
+                .values(finalizer_identity=unverified_identity)
+            )
+        projection_tampered = await client.get(
+            f"/api/v1/runs/{injected_run_id}"
+        )
+        assert projection_tampered.status_code == 200
+        assert projection_tampered.json()["finalizer_identity"] == (
+            "boundary.phase1.evidence-finalizer/v1"
+        )
+
+        malformed_manifest = {
+            **evidence_set.manifest,
+            "finalizer_identity": unverified_identity,
+        }
+        async with database_engine.begin() as connection:
+            await connection.execute(
+                evidence_sets.update()
+                .where(evidence_sets.c.evidence_set_id == evidence_set_id)
+                .values(manifest=malformed_manifest)
+            )
+        integrity_failed = await client.get(
+            f"/api/v1/runs/{injected_run_id}"
+        )
+        assert integrity_failed.status_code == 500
+        assert integrity_failed.json()["code"] == (
+            "EVIDENCE_SET_INTEGRITY_FAILED"
+        )
+        assert unverified_identity not in integrity_failed.text
+
 
 async def test_unknown_public_resources_are_404() -> None:
     unknown = uuid4()
@@ -267,6 +312,13 @@ async def test_pending_and_terminal_campaign_cancellation_is_idempotent() -> Non
             await client.get(f"/api/v1/campaigns/{second_id}")
         ).json()
         assert queued_second["operational_status"] == "accepted"
+        queued_run = await client.get(
+            f"/api/v1/runs/{queued_second['control_run_id']}"
+        )
+        assert queued_run.status_code == 200
+        assert queued_run.json()["operational_status"] == "accepted"
+        assert queued_run.json()["evidence_set_id"] is None
+        assert queued_run.json()["finalizer_identity"] is None
 
         cancellation_key = f"cancel-command-{uuid4()}"
         cancelled = await client.post(

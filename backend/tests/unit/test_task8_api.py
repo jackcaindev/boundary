@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
+from boundary.api.models import RunView
 from boundary.config import BoundarySettings, ConfigurationError
 from boundary.main import create_app
 
@@ -66,6 +68,23 @@ async def test_invalid_evidence_cursor_and_limit_are_bounded() -> None:
 
     assert response.status_code == 422
     assert response.json()["code"] == "INVALID_REQUEST"
+
+
+def test_run_view_strictly_serializes_finalizer_identity() -> None:
+    schema = RunView.model_json_schema()
+
+    assert schema["additionalProperties"] is False
+    assert "finalizer_identity" in schema["required"]
+
+    view = RunView.model_construct(
+        finalizer_identity="boundary.phase1.evidence-finalizer/v1"
+    )
+    assert view.model_dump()["finalizer_identity"] == (
+        "boundary.phase1.evidence-finalizer/v1"
+    )
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RunView.model_validate({"unexpected": "field"})
 
 
 def test_task8_timing_configuration_must_match_immutable_definition() -> None:

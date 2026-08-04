@@ -78,6 +78,7 @@ class RunView(PublicModel):
     fault_definition_digest: str | None
     evidence_set_id: UUID | None
     evidence_set_digest: str | None
+    finalizer_identity: str | None
     analysis_id: UUID | None
     analysis_digest: str | None
     analyzer_version: str | None
