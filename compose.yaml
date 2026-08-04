@@ -1,4 +1,29 @@
 services:
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      boundary:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5173:5173"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --tries=1
+        - --timeout=2
+        - --spider
+        - http://127.0.0.1:5173/healthz
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - edge
+      - app
+
   postgres:
     image: postgres:17.10-bookworm
     environment:
@@ -138,6 +163,7 @@ volumes:
   boundary-postgres:
 
 networks:
+  edge:
   data:
     internal: true
   app:
