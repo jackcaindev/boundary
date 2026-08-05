@@ -160,6 +160,18 @@ docker compose -f compose.yaml -f docker/compose.real-model.yaml exec -T sample-
 
 Then run the complete UI workflow at [http://127.0.0.1:5173](http://127.0.0.1:5173), or run the Playwright UI journey with `npm test` from `tests/e2e`. Preserve the emitted IDs and inspect the vulnerable `vulnerable-v1` versus fixed `fixed-v1` controller versions. Create `docs/verification/real-model-demonstration.md` only after the full real run succeeds. Never commit the secret or raw provider content.
 
+### Real-model network preflight
+
+Before a real-model browser demonstration, start the real topology with the override above and verify every service is healthy. Read the sample-agent `/health` response from inside the already-running container and confirm that its model identity is the intended `openai/<model>` identity; this health request must not call the provider.
+
+From that same already-running sample-agent container, perform these three independent checks against `api.openai.com`, each with a short explicit timeout and without sending HTTP:
+
+1. Resolve DNS.
+2. Open and close one TCP connection to port 443.
+3. Open one TLS connection with SNI, certificate validation, and hostname validation enabled; complete only the TLS handshake, then close it.
+
+Do not print or retain proxy settings, credentials, request headers, prompts, arguments, or exception messages while checking connectivity. Proceed immediately only if health, model identity, DNS, TCP/443, and TLS validation all pass. Then run exactly one `tests/e2e` browser journey with `npm test` once, with no retry. If any preflight check fails, do not start the browser journey. Do not add a provider-calling health check, sleep, retry, or infrastructure for this preflight.
+
 ## Shutdown and reset
 
 Normal shutdown preserves local PostgreSQL data:

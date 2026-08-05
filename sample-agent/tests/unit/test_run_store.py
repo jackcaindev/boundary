@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
+from openai import APIConnectionError
 import pytest
 
 from conftest import RUN_ID, control_request, control_store
@@ -17,7 +20,11 @@ from sample_agent.run_store import (
     PayloadLimitExceeded,
     StoreCapacityExceeded,
 )
-from sample_agent.model import ModelSelectionError
+from sample_agent.model import (
+    ModelFailureDiagnostic,
+    ModelSelectionError,
+    OpenAIModelAdapter,
+)
 
 
 def _started(sequence: int) -> RunStartedEvent:
@@ -139,13 +146,21 @@ async def test_process_local_run_retention_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_failure_is_a_safe_bounded_terminal_state() -> None:
+async def test_provider_failure_is_a_safe_bounded_terminal_state(caplog) -> None:
     class FailingModel:
         model_identity = "openai/gpt-test"
 
         async def select_tool(self, query: str):
             del query
-            raise ModelSelectionError("raw provider detail must not escape")
+            raise ModelSelectionError(
+                ModelFailureDiagnostic(
+                    category="provider_http",
+                    exception_class="BadRequestError",
+                    transport_exception_class=None,
+                    http_status=400,
+                    provider_request_id="req_safe-123",
+                )
+            )
 
     store = control_store(model=FailingModel())
     await store.create(control_request())
@@ -154,8 +169,62 @@ async def test_provider_failure_is_a_safe_bounded_terminal_state() -> None:
 
     status = await store.status(RUN_ID)
     assert status.state == "failed"
-    assert status.error_summary == "Model selection failed"
+    assert status.error_summary == (
+        "Model selection failed; category=provider_http; "
+        "exception_class=BadRequestError; http_status=400; "
+        "provider_request_id=req_safe-123"
+    )
+    assert len(status.error_summary) <= 512
     assert status.terminal_result is not None
     assert status.terminal_result.output is None
     page = await store.events(RUN_ID, 0)
     assert page.events[-1].payload.error_code == "MODEL_SELECTION_FAILED"
+    assert "category=provider_http" in caplog.text
+    assert "exception_class=BadRequestError" in caplog.text
+    assert "http_status=400" in caplog.text
+    assert "provider_request_id=req_safe-123" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_provider_raw_details_never_reach_status_events_or_logs(caplog) -> None:
+    class FailingResponses:
+        async def create(self, **kwargs):
+            del kwargs
+            nested = RuntimeError("sensitive-nested-message")
+            transport = httpx.ConnectError(
+                "sensitive-transport-message",
+                request=httpx.Request(
+                    "POST", "https://api.openai.com/v1/responses"
+                ),
+            )
+            transport.__cause__ = nested
+            provider = APIConnectionError(
+                request=transport.request,
+                message="sensitive-provider-message",
+            )
+            provider.__cause__ = transport
+            raise provider
+
+    model = OpenAIModelAdapter(
+        client=SimpleNamespace(responses=FailingResponses()),
+        model="gpt-test",
+        request_timeout_ms=1000,
+    )
+    store = control_store(model=model)
+    await store.create(control_request(query="sensitive-tested-input"))
+
+    await store.execute(RUN_ID)
+
+    status = await store.status(RUN_ID)
+    page = await store.events(RUN_ID, 0)
+    assert status.error_summary == (
+        "Model selection failed; category=provider_transport; "
+        "exception_class=APIConnectionError; "
+        "transport_exception_class=ConnectError"
+    )
+    assert page.events[-1].payload.error_code == "MODEL_SELECTION_FAILED"
+    retained_text = f"{status.model_dump_json()} {page.model_dump_json()} {caplog.text}"
+    assert "sensitive-provider-message" not in retained_text
+    assert "sensitive-transport-message" not in retained_text
+    assert "sensitive-nested-message" not in retained_text
+    assert "sensitive-tested-input" not in retained_text

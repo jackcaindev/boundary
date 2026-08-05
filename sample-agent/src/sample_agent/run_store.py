@@ -7,6 +7,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
+import logging
 from typing import Literal, cast
 from uuid import UUID, uuid4
 
@@ -63,6 +64,7 @@ MAX_RETAINED_RUNS = 128
 EVENT_PAGE_SIZE = 64
 
 _EVENT_ADAPTER = TypeAdapter(EventEnvelope)
+_LOGGER = logging.getLogger(__name__)
 
 
 class RunConflict(Exception):
@@ -325,11 +327,23 @@ class RunStore:
                 )
                 self._append(record, failed)
                 record.state = "failed"
-                record.error_summary = (
-                    "Model selection failed"
-                    if isinstance(error, ModelSelectionError)
-                    else "Boundary tool call failed"
-                )
+                if isinstance(error, ModelSelectionError):
+                    diagnostic = error.diagnostic
+                    record.error_summary = diagnostic.operational_summary()
+                    _LOGGER.warning(
+                        "model_selection_failed run_id=%s category=%s "
+                        "exception_class=%s transport_exception_class=%s "
+                        "http_status=%s "
+                        "provider_request_id=%s",
+                        record.run_id,
+                        diagnostic.category,
+                        diagnostic.exception_class,
+                        diagnostic.transport_exception_class,
+                        diagnostic.http_status,
+                        diagnostic.provider_request_id,
+                    )
+                else:
+                    record.error_summary = "Boundary tool call failed"
                 self._seal(
                     record,
                     event=failed,

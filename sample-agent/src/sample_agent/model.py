@@ -5,8 +5,30 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import os
+import re
 from typing import Any, Literal, Mapping, Protocol
 
+from httpx import (
+    ConnectError,
+    LocalProtocolError,
+    ProxyError,
+    ReadError,
+    RemoteProtocolError,
+    WriteError,
+)
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
@@ -42,8 +64,166 @@ class ModelConfigurationError(ValueError):
     """The selected model mode is not safely configured."""
 
 
+ModelFailureCategory = Literal[
+    "provider_http",
+    "provider_timeout",
+    "provider_transport",
+    "provider_model_access",
+    "provider_output_malformed",
+    "provider_arguments_invalid",
+    "provider_unknown",
+]
+_MODEL_FAILURE_CATEGORIES = frozenset(
+    {
+        "provider_http",
+        "provider_timeout",
+        "provider_transport",
+        "provider_model_access",
+        "provider_output_malformed",
+        "provider_arguments_invalid",
+        "provider_unknown",
+    }
+)
+
+_ALLOWED_PROVIDER_EXCEPTION_CLASSES = (
+    APITimeoutError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    BadRequestError,
+    ConflictError,
+    UnprocessableEntityError,
+    RateLimitError,
+    InternalServerError,
+    APIConnectionError,
+    APIStatusError,
+)
+_ALLOWED_PROVIDER_EXCEPTION_NAMES = frozenset(
+    allowed.__name__ for allowed in _ALLOWED_PROVIDER_EXCEPTION_CLASSES
+)
+_ALLOWED_TRANSPORT_EXCEPTION_CLASSES = (
+    ConnectError,
+    ReadError,
+    WriteError,
+    ProxyError,
+    RemoteProtocolError,
+    LocalProtocolError,
+)
+_ALLOWED_TRANSPORT_EXCEPTION_NAMES = frozenset(
+    allowed.__name__ for allowed in _ALLOWED_TRANSPORT_EXCEPTION_CLASSES
+)
+_SAFE_REQUEST_ID = re.compile(r"req_[A-Za-z0-9._:-]{1,124}")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelFailureDiagnostic:
+    """Bounded provider metadata that is safe for status and logs."""
+
+    category: ModelFailureCategory
+    exception_class: str | None = None
+    transport_exception_class: str | None = None
+    http_status: int | None = None
+    provider_request_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.category not in _MODEL_FAILURE_CATEGORIES:
+            raise ValueError("model failure category is invalid")
+        if (
+            self.transport_exception_class is not None
+            and self.transport_exception_class
+            not in _ALLOWED_TRANSPORT_EXCEPTION_NAMES
+        ):
+            raise ValueError("transport exception class is not allowlisted")
+        if (
+            self.exception_class is not None
+            and self.exception_class not in _ALLOWED_PROVIDER_EXCEPTION_NAMES
+        ):
+            raise ValueError("provider exception class is not allowlisted")
+        if self.http_status is not None and not 100 <= self.http_status <= 599:
+            raise ValueError("provider HTTP status is invalid")
+        if (
+            self.provider_request_id is not None
+            and _SAFE_REQUEST_ID.fullmatch(self.provider_request_id) is None
+        ):
+            raise ValueError("provider request ID is invalid")
+
+    def operational_summary(self) -> str:
+        fields = [f"category={self.category}"]
+        if self.exception_class is not None:
+            fields.append(f"exception_class={self.exception_class}")
+        if self.transport_exception_class is not None:
+            fields.append(
+                "transport_exception_class="
+                f"{self.transport_exception_class}"
+            )
+        if self.http_status is not None:
+            fields.append(f"http_status={self.http_status}")
+        if self.provider_request_id is not None:
+            fields.append(f"provider_request_id={self.provider_request_id}")
+        return "Model selection failed; " + "; ".join(fields)
+
+
 class ModelSelectionError(ValueError):
     """The provider did not return one valid reviewed tool selection."""
+
+    def __init__(self, diagnostic: ModelFailureDiagnostic) -> None:
+        super().__init__("model selection failed")
+        self.diagnostic = diagnostic
+
+
+def _provider_failure_diagnostic(error: Exception) -> ModelFailureDiagnostic:
+    exception_class = next(
+        (
+            allowed.__name__
+            for allowed in _ALLOWED_PROVIDER_EXCEPTION_CLASSES
+            if isinstance(error, allowed)
+        ),
+        None,
+    )
+    transport_exception_class = None
+    if isinstance(error, APITimeoutError):
+        category: ModelFailureCategory = "provider_timeout"
+    elif isinstance(
+        error,
+        (AuthenticationError, PermissionDeniedError, NotFoundError),
+    ):
+        category = "provider_model_access"
+    elif isinstance(error, APIConnectionError):
+        category = "provider_transport"
+        direct_cause_type = type(error.__cause__)
+        transport_exception_class = next(
+            (
+                allowed.__name__
+                for allowed in _ALLOWED_TRANSPORT_EXCEPTION_CLASSES
+                if direct_cause_type is allowed
+            ),
+            None,
+        )
+    elif isinstance(error, APIStatusError):
+        category = "provider_http"
+    else:
+        category = "provider_unknown"
+
+    raw_status = getattr(error, "status_code", None)
+    http_status = (
+        raw_status
+        if isinstance(raw_status, int) and 100 <= raw_status <= 599
+        else None
+    )
+    raw_request_id = getattr(error, "request_id", None)
+    provider_request_id = (
+        raw_request_id
+        if isinstance(raw_request_id, str)
+        and _SAFE_REQUEST_ID.fullmatch(raw_request_id) is not None
+        else None
+    )
+    return ModelFailureDiagnostic(
+        category=category,
+        exception_class=exception_class,
+        transport_exception_class=transport_exception_class,
+        http_status=http_status,
+        provider_request_id=provider_request_id,
+    )
 
 
 class _LookupArguments(BaseModel):
@@ -155,7 +335,9 @@ class OpenAIModelAdapter:
                 timeout=self._request_timeout_seconds,
             )
         except Exception as error:
-            raise ModelSelectionError("provider selection failed") from error
+            raise ModelSelectionError(
+                _provider_failure_diagnostic(error)
+            ) from None
 
         output = getattr(response, "output", None)
         calls = [
@@ -168,15 +350,19 @@ class OpenAIModelAdapter:
             or getattr(calls[0], "name", None) != OPENAI_TOOL_NAME
         ):
             raise ModelSelectionError(
-                "provider selection was not one reviewed tool call"
+                ModelFailureDiagnostic(category="provider_output_malformed")
             )
         raw_arguments = getattr(calls[0], "arguments", None)
         if not isinstance(raw_arguments, str) or len(raw_arguments) > 8192:
-            raise ModelSelectionError("provider tool arguments are invalid")
+            raise ModelSelectionError(
+                ModelFailureDiagnostic(category="provider_arguments_invalid")
+            )
         try:
             parsed = _LookupArguments.model_validate(json.loads(raw_arguments))
-        except (json.JSONDecodeError, ValidationError) as error:
-            raise ModelSelectionError("provider tool arguments are invalid") from error
+        except (json.JSONDecodeError, ValidationError):
+            raise ModelSelectionError(
+                ModelFailureDiagnostic(category="provider_arguments_invalid")
+            ) from None
         return ToolSelection(
             tool=EXPECTED_TOOL,
             arguments={"query": parsed.query},
